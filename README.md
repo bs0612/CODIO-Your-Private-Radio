@@ -107,7 +107,7 @@ node --check desktop/preload.cjs
 npm run desktop:build
 ```
 
-结构 / Structure: `app/` contains the interface, listening memory and audio logic; `desktop/` contains Electron bridges and local services; `tests/` contains isolated automated tests. Personal diagnostics, machine-specific migration scripts, backups and speech models are not source dependencies and are excluded.
+结构 / Structure: `app/` contains the interface, listening memory and audio logic; `desktop/` contains Electron bridges and local services; `tests/` contains isolated automated tests. Inside `app/`, `RadioExperience.tsx` holds the radio itself, with the self-contained pieces in their own modules: `particle-gl.ts` (GPU album particles and halo), `aurora-gl.ts` (home sky), `media-session.ts` (OS media keys), `sleep-timer.ts`, `keyboard-shortcuts.ts`, `listening-backup.ts` and the shared `radio-types.ts`. Personal diagnostics, machine-specific migration scripts, backups and speech models are not source dependencies and are excluded.
 
 已知类型检查边界 / Known type-check boundary: retained Cloudflare template files have independent environment-type gaps for `cloudflare:workers`, `Fetcher` and `D1Database`. These are reported separately from desktop build results, not hidden to claim a clean full-project type check. `.openai/hosting.json` contains empty local bindings only, not the original hosted project's identity or deployment credentials.
 
