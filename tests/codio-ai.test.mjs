@@ -16,6 +16,13 @@ const {
 
 const response = (status) => ({ ok: status >= 200 && status < 300, status });
 
+test("preference evidence is bounded at the IPC boundary, not silently filtered", () => {
+  const args = { target_type: "artist", artist_name: "Verified Artist", value: "more", evidence_text: "Verified Artist really works for me" };
+  assert.equal(validateToolArguments("record_music_preference", args), true);
+  assert.equal(validateToolArguments("record_music_preference", { ...args, evidence_text: "x".repeat(401) }), false);
+  assert.equal(validateToolArguments("record_music_preference", { ...args, evidence_text: {} }), false);
+});
+
 test("DeepSeek deadline covers the response body, not just response headers", async () => {
   await assert.rejects(() => requestDeepSeek(async (_url, options) => ({ ok: true, status: 200,
     json: () => new Promise((_resolve, reject) => options.signal.addEventListener("abort", () => reject(Object.assign(new Error("aborted"), { name: "AbortError" })))),

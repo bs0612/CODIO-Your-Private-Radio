@@ -21,6 +21,15 @@ function helper(name, context) {
   assert.ok(functions.has(name), `Missing production helper: ${name}`);
   return bind(`${functions.get(name)};return ${name};`, context);
 }
+function handler(name, context) {
+  let initializer;
+  (function visit(node) {
+    if (ts.isVariableDeclaration(node) && node.name.getText(ast) === name) initializer = node.initializer?.getText(ast);
+    ts.forEachChild(node, visit);
+  })(ast);
+  assert.ok(initializer, `Missing production handler ${name}`);
+  return bind(`return ${initializer};`, context);
+}
 function effect(marker, context, transform = code => code) {
   const matching = effects.filter(code => code.includes(marker));
   assert.equal(matching.length, 1, `Exactly one production effect must contain ${marker}`);
@@ -41,6 +50,25 @@ function originalWaveFormula(code) {
   for (const statement of framePhaseStatements) original = original.replace(statement.getText(effectAst), "");
   return original;
 }
+
+function originalPointerFormula(code) {
+  const effectAst = ts.createSourceFile("particle-effect.ts", code, ts.ScriptTarget.Latest, true, ts.ScriptKind.TS);
+  const branches = [];
+  (function visit(node) {
+    if (ts.isIfStatement(node) && node.expression.getText(effectAst) === "distanceSquared < influenceRadiusSquared && !reducedMotion") branches.push(node);
+    ts.forEachChild(node, visit);
+  })(effectAst);
+  assert.equal(branches.length, 1, "Compare the actual production attraction branch");
+  return code.replace("const strideSize =", "const influenceRadius = Math.min(126, Math.min(width, height) * .17); const strideSize =")
+    .replace(branches[0].getText(effectAst), `if (distanceSquared < influenceRadiusSquared && !reducedMotion) {
+      const distance = Math.sqrt(distanceSquared);
+      const influence = Math.pow(1 - distance / influenceRadius, 1.72);
+      const depthLayer = Math.max(.28, Math.min(1.18, .7 + depth / Math.max(size, 1)));
+      const force = influence * (10 + depthLayer * 16 + music.breath * 3);
+      x += (deltaX / Math.max(distance, 1)) * force;
+      y += (deltaY / Math.max(distance, 1)) * force;
+    }`);
+}
 const flush = async () => { for (let i = 0; i < 8; i++) await Promise.resolve(); };
 const deferred = () => { let resolve; const promise = new Promise(done => { resolve = done; }); return { promise, resolve }; };
 const points = (rgb = [210, 50, 50], count = 64) => Array.from({ length: count }, (_, i) => ({
@@ -48,9 +76,9 @@ const points = (rgb = [210, 50, 50], count = 64) => Array.from({ length: count }
 }));
 const color = rgb => `rgb(${rgb.join(" ")})`;
 
-function harness({ cover = "a", mid = "a", previous = "", cached = [], oldPoints = [], samples = new Map(), costPerDot = 0, math = Math, originalWave = false } = {}) {
+function harness({ cover = "a", mid = "a", previous = "", cached = [], oldPoints = [], samples = new Map(), costPerDot = 0, math = Math, originalWave = false, originalPointer = false } = {}) {
   const frames = new Map(), fills = [], requested = [], visibilityListeners = new Set(), resizeListeners = new Set(), focusListeners = new Set(), blurListeners = new Set();
-  const calls = { clear: 0, fill: 0 };
+  const calls = { clear: 0, fill: 0, pointerStyles: 0 };
   let nextFrame = 0, clock = 1000, workMs = 0;
   const ctx = {
     setTransform() {}, clearRect() { calls.clear++; fills.length = 0; },
@@ -70,12 +98,14 @@ function harness({ cover = "a", mid = "a", previous = "", cached = [], oldPoints
     },
     performance: { now: () => clock + workMs },
     nowCanvasRef: { current: { clientWidth: 1200, clientHeight: 800, getContext: () => ctx } },
+    nowStageRef: { current: { style: { setProperty() { calls.pointerStyles++; } } } },
     nowPlayingOpen: true, visualMode: "particles", particleLevel: 2, reducedMotion: false, lyricMode: "full", isPlaying: false,
     currentTrack: { color: "violet", bpm: 90, cover }, NOW_INITIAL_RX: -7, NOW_INITIAL_RY: 9,
     nowPointerRef: { current: { x: 0, y: 0, visualX: 0, visualY: 0, rx: -7, ry: 9, zoom: 1,
       dragging: false, returning: false, velocityX: 0, velocityY: 0, velocityZoom: 0 } },
     previousCoverSourceRef: { current: previous }, previousCoverPointsRef: { current: oldPoints },
     particleRenderStridesRef: { current: new Map() },
+    pointerAttractionTableRef: { current: null },
     coverPointCloudsRef: { current: new Map(cached.map(([key, value]) => [`192:${key}`, value])) },
     coverPointPromisesRef: { current: new Map() }, coverPointPairsRef: { current: new Map() },
     currentCoverData: cover, activeQQTrack: { mid, cover },
@@ -92,7 +122,11 @@ function harness({ cover = "a", mid = "a", previous = "", cached = [], oldPoints
   c.spatiallyPairCoverPoints = helper("spatiallyPairCoverPoints", c);
   c.prepareCoverPointCloud = helper("prepareCoverPointCloud", c);
   c.getAudiblePlaybackTime = helper("getAudiblePlaybackTime", c);
-  const run = () => effect("const drawAlbum", c, originalWave ? originalWaveFormula : undefined)();
+  c.createPointerAttractionTable = helper("createPointerAttractionTable", c);
+  const run = () => effect("const drawAlbum", c, code => {
+    if (originalWave) code = originalWaveFormula(code);
+    return originalPointer ? originalPointerFormula(code) : code;
+  })();
   function draw(at = clock) {
     clock = at; workMs = 0;
     const entry = frames.entries().next().value;
@@ -509,5 +543,130 @@ test("the actual handoff field reads the authoritative Deck analyser and the sam
   assert.ok(Math.abs(observed[1].time - (2 - .095 * 1.03)) < 1e-10);
   assert.equal(calls.global, 0, "Preparing an incoming global analyser must not animate the still-authoritative outgoing Deck");
   assert.equal(h.c.frequencyDataRef.current.length, 16, "Buffers follow the selected analyser's bin count");
+  cleanup();
+});
+
+test("the bounded radial table preserves attraction through the centre and radius without colour changes", t => {
+  const makeTable = helper("createPointerAttractionTable", { Math });
+  assert.deepEqual([...makeTable(0)], [0, 0]);
+  let maximumError = 0;
+  for (const radius of [1, 17.37, 68, 126]) {
+    const table = makeTable(radius);
+    assert.ok(table.byteLength <= 254020, "One table, not a screen-position by particle matrix");
+    for (let i = 0; i < 20000; i++) {
+      const distance = i / 20000 * radius, squaredIndex = distance * distance * (table.length - 1) / (radius * radius);
+      const index = Math.floor(squaredIndex), fraction = squaredIndex - index;
+      const factor = table[index] + (table[index + 1] - table[index]) * fraction;
+      const expected = Math.pow(1 - distance / radius, 1.72) * distance / Math.max(distance, 1);
+      const error = Math.abs(factor * distance - expected) * 32;
+      maximumError = Math.max(maximumError, error);
+      assert.ok(Number.isFinite(factor) && factor >= 0);
+      assert.ok(error < .16, `${radius}px radius, ${distance}px distance: ${error}px displacement error`);
+    }
+  }
+  t.diagnostic(`Maximum attraction displacement approximation error: ${maximumError.toFixed(4)} CSS px (32px force bound)`);
+});
+
+test("all pointer positions reuse one table across beats, modes, covers and reopen; only a changed radius rebuilds", async () => {
+  const h = harness({ cached: [["a", points()], ["b", points([40, 180, 90])]] });
+  let builds = 0;
+  const build = h.c.createPointerAttractionTable;
+  h.c.createPointerAttractionTable = radius => { builds++; return build(radius); };
+  let cleanup = h.run(); h.draw();
+  const original = h.c.pointerAttractionTableRef.current;
+  for (let i = 0; i < 80; i++) {
+    Object.assign(h.c.nowPointerRef.current, { x: i / 40 - 1, y: Math.sin(i), dragging: true });
+    h.draw(1016 + i * 16);
+  }
+  h.change("b", "b"); h.draw(2400); await flush(); h.draw(2600); h.draw(5000);
+  cleanup(); h.c.lyricMode = "minimal"; cleanup = h.run(); h.draw(5100);
+  assert.equal(h.c.pointerAttractionTableRef.current, original);
+  assert.equal(builds, 1, "Pointer events, cover morph and layout/reopen must not regenerate the table");
+  h.c.nowCanvasRef.current.clientHeight = 600;
+  for (const listener of h.resizeListeners) listener();
+  assert.equal(builds, 2); assert.notEqual(h.c.pointerAttractionTableRef.current, original);
+  for (const listener of h.resizeListeners) listener();
+  assert.equal(builds, 2); assert.ok(h.draw(5200).every(dot => Number.isFinite(dot.x) && Number.isFinite(dot.y)));
+  cleanup(); h.c.reducedMotion = true; cleanup = h.run(); h.draw(5300);
+  assert.equal(builds, 2, "Reduced motion needs no force table rebuild"); cleanup();
+});
+
+test("production lookup retains hover, 3D poses, beat bursts and song morph without extra paints", async t => {
+  const cloud = points().map(point => ({ ...point, radius: Math.hypot(point.nx, point.ny), angle: Math.atan2(point.ny, point.nx) }));
+  const actual = harness({ cached: [["a", cloud], ["b", points([40, 180, 90])]] });
+  const original = harness({ cached: [["a", cloud], ["b", points([40, 180, 90])]], originalPointer: true });
+  const cleanups = [actual.run(), original.run()];
+  let maximumError = 0;
+  for (let frame = 0; frame < 80; frame++) {
+    for (const h of [actual, original]) {
+      h.c.musicAudioRef.current = { paused: false, currentTime: frame / 10 };
+      h.c.lyricMode = frame % 2 ? "full" : "minimal";
+      Object.assign(h.c.nowPointerRef.current, { x: Math.sin(frame * .23), y: Math.cos(frame * .17), dragging: true,
+        rx: frame % 80 - 40, ry: frame * 3, zoom: .8 + frame % 10 * .04 });
+      h.c.getMusicVisualFrame = () => ({ beatEnvelope: .8, downbeatEnvelope: .6, beatPhase: frame % 9 / 9,
+        continuousEnergy: .7, phraseEnvelope: .5, dramaticEnvelope: frame < 15 ? .8 : 0 });
+      if (frame === 30) h.change("b", "b");
+    }
+    const a = actual.draw(1000 + frame * 40), b = original.draw(1000 + frame * 40);
+    assert.equal(a.length, b.length);
+    for (let i = 0; i < a.length; i++) {
+      for (const field of ["color", "alpha", "width", "height"]) assert.equal(a[i][field], b[i][field]);
+      maximumError = Math.max(maximumError, Math.hypot(a[i].x - b[i].x, a[i].y - b[i].y));
+    }
+    await flush();
+  }
+  assert.ok(maximumError < .16); assert.equal(actual.calls.fill, original.calls.fill);
+  t.diagnostic(`Actual Canvas effect: max coordinate difference ${maximumError.toFixed(4)} CSS px; colours, alpha, density and paints unchanged`);
+  cleanups.forEach(cleanup => cleanup());
+});
+
+test("warm actual pointer frames no longer call per-nearby-point sqrt/pow", t => {
+  const count = 4096, cloud = Array.from({ length: count }, (_, i) => {
+    const nx = i % 64 / 64 - .5, ny = Math.floor(i / 64) / 64 - .5;
+    return { nx, ny, radius: Math.hypot(nx, ny), angle: Math.atan2(ny, nx), rgb: [120, 180, 230], alpha: .9, seed: i / count };
+  });
+  const measured = originalPointer => {
+    const counts = { sqrt: 0, pow: 0 }, math = Object.create(Math);
+    for (const name of ["sqrt", "pow"]) math[name] = (...args) => { counts[name]++; return Math[name](...args); };
+    const h = harness({ cached: [["a", cloud]], math, originalPointer }), cleanup = h.run();
+    h.c.musicAudioRef.current = { paused: false, currentTime: 42 }; h.draw();
+    counts.sqrt = 0; counts.pow = 0;
+    for (let i = 0; i < 30; i++) {
+      Object.assign(h.c.nowPointerRef.current, { x: Math.sin(i * .1) * .3, y: Math.cos(i * .1) * .3 });
+      h.draw(1016 + i * 16);
+    }
+    cleanup(); return { counts, paints: h.calls.fill };
+  };
+  const before = measured(true), after = measured(false);
+  assert.equal(after.paints, before.paints);
+  assert.equal(after.counts.sqrt, 30, "Only one fixed stride square root per frame remains");
+  assert.equal(after.counts.pow, 30, "Only the existing frame-level choreography power remains");
+  assert.ok(before.counts.sqrt > 10000 && before.counts.pow > 10000);
+  t.diagnostic(`${count} points x 30 moving-pointer frames: sqrt ${before.counts.sqrt} -> ${after.counts.sqrt}; pow ${before.counts.pow} -> ${after.counts.pow}; paints ${before.paints} unchanged`);
+});
+
+test("high-rate pointer input does not repaint the hidden home or write background styles between frames", () => {
+  const h = harness({ cached: [["a", points()]] });
+  const homeStyles = [], sceneStyles = new Map();
+  h.c.nowPlayingEdge = null; h.c.edgeIntentRef = { current: { zone: null, timer: null } };
+  h.c.rootRef = { current: { style: { setProperty: (...args) => homeStyles.push(args) } } };
+  h.c.window.innerHeight = 800;
+  const style = h.c.nowStageRef.current.style.setProperty;
+  h.c.nowStageRef.current.style.setProperty = (key, value) => { style(key, value); sceneStyles.set(key, value); };
+  const move = handler("handleNowPointerMove", h.c), home = handler("handleParallax", h.c);
+  const cleanup = h.run(); h.draw(); const before = h.calls.pointerStyles;
+  const currentTarget = { getBoundingClientRect: () => ({ left: 0, top: 0, width: 1200, height: 800 }) };
+  for (let i = 0; i < 1000; i++) {
+    const event = { clientX: 500 + i / 10, clientY: 380 + i / 100, currentTarget };
+    move(event); home(event);
+  }
+  assert.equal(h.calls.pointerStyles, before); assert.equal(homeStyles.length, 0);
+  assert.equal(h.frames.size, 1, "Input must not schedule its own competing loop");
+  h.draw(1100); assert.equal(h.calls.pointerStyles, before + 2);
+  assert.equal(sceneStyles.get("--np-x"), `${h.c.nowPointerRef.current.x * 18}px`);
+  assert.equal(sceneStyles.get("--np-y"), `${h.c.nowPointerRef.current.y * 14}px`);
+  h.draw(1116); assert.equal(h.calls.pointerStyles, before + 2, "No style churn when the input is unchanged");
+  h.c.nowPlayingOpen = false; home({ clientX: 600, clientY: 400 });
+  assert.equal(homeStyles.length, 4, "The visible home keeps its original pointer parallax");
   cleanup();
 });

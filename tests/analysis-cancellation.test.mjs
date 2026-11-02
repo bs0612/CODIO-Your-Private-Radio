@@ -44,6 +44,10 @@ function clock() {
   };
 }
 const signature = "00".repeat(32);
+const dsp = await import(`data:text/javascript;base64,${Buffer.from(ts.transpileModule(
+  await readFile(new URL("../app/seamless-dj.ts", import.meta.url), "utf8"),
+  { compilerOptions: { target: ts.ScriptTarget.ES2022, module: ts.ModuleKind.ES2022 } },
+).outputText).toString("base64")}`);
 const analysis = trackId => ({ version: 3, trackId, sourceSignature: signature, duration: 240, waveform: Array(96).fill(.2), tempoConfidence: .7, bpm: 100, beats: [], phraseBoundaries: [], analysisConfidence: .7 });
 function response() {
   let done = false;
@@ -168,6 +172,37 @@ test("playback analysis persists reusable initial-waveform identity across a res
   restarted.cleanup();
 });
 
+test("integer catalogue duration cannot reject the real fractional PCM duration or force a second download", async () => {
+  const h=harness(),rate=12000,length=Math.round(2.814*rate),pcm=new Float32Array(length);
+  for(let i=0;i<length;i++)pcm[i]=(.1+.6*i/length)*Math.sin(i/rate*Math.PI*440);
+  const track={provider:"qq",mid:"fractional-fixture",mediaMid:"same-file",durationSeconds:2};
+  h.buffer.duration=length/rate;h.buffer.sampleRate=rate;h.buffer.getChannelData=()=>pcm;
+  h.context.activeQQTrackLiveRef.current=track;h.context.playQueueRef.current=[track];
+  h.context.analyzePcmTrack=dsp.analyzePcmTrack;h.context.isTrackAnalysisSourceValid=dsp.isTrackAnalysisSourceValid;
+  const result=await h.handlers.analyseTrackSource(track.mid,"qa://fractional",track.durationSeconds);
+  assert.ok(result,"use the decoded file duration, not the rounded catalogue hint");
+  assert.equal(result.duration,length/rate);assert.equal(result.waveform.length,96);
+  assert.equal(dsp.isTrackAnalysisSourceValid(result,track.mid,signature,result.duration),true);
+  assert.equal(dsp.isTrackAnalysisSourceValid(result,track.mid,signature,2),false,"actual deck duration checks must remain strict");
+  assert.equal(dsp.isTrackAnalysisSourceValid(result,track.mid,"wrong-source",result.duration),false);
+  assert.equal(await h.handlers.analyseTrackSource(track.mid,"qa://fractional",track.durationSeconds),result);
+  assert.equal(h.fetches.length,1,"the same verified bytes and actual duration are reusable");
+  const saved=h.calls.find(([name])=>name==="save")[2];h.cleanup();
+  const restarted=harness();restarted.context.window.codioDesktop.analysis.get=async()=>saved;
+  restarted.context.prepareTrack=()=>assert.fail("valid media-bound waveform must survive restart without downloading again");
+  assert.deepEqual(await restarted.handlers.prepareInitialWaveform(track),result.waveform);restarted.cleanup();
+});
+
+test("disk analysis with an exact byte digest is checked against its decoded duration, with the catalogue only a coarse guard", async () => {
+  const h=harness(),rate=12000,pcm=Float32Array.from({length:33768},(_,i)=>.4*Math.sin(i/rate*Math.PI*440));
+  const cached=dsp.analyzePcmTrack({trackId:"disk-fractional",sampleRate:rate,channels:[pcm],sourceSignature:signature});
+  h.context.isTrackAnalysisSourceValid=dsp.isTrackAnalysisSourceValid;
+  h.context.window.codioDesktop.analysis.get=async()=>cached;
+  const result=await h.handlers.analyseTrackSource("disk-fractional","qa://same-bytes",2);
+  assert.equal(result,cached);assert.ok(!h.calls.some(([name])=>name==="decoded"));
+  assert.equal(h.context.analysisSourceRef.current.get("disk-fractional").duration,cached.duration);h.cleanup();
+});
+
 test("stalled disk cache lookup falls back to bounded analysis instead of occupying a slot forever", async () => {
   const h = harness({ diskGate: deferred() }), pending = h.handlers.analyseTrackSource("song", "qa://source");
   await flush(); await h.time.advance(1200);
@@ -186,6 +221,22 @@ test("a late next-source response after manual selection cannot schedule stale a
   h.context.activeQQTrackLiveRef.current = { mid: "manual-choice" };
   source.resolve({ playback: { url: "qa://stale-next" }, coverData: "qa://cover" }); await flush();
   assert.equal(h.fetches.length, 0); assert.equal(h.context.transitionPlansRef.current.size, 0); h.cleanup();
+});
+
+test("an adopted deck obtains its own timeline and pair planning waits for its real analysis", async()=>{
+  const h=harness(),current={mid:"adopted"},next={mid:"next"};
+  const audio={src:"qa://adopted",dataset:{codioSource:"qa://adopted"},duration:240,currentTime:0,error:null,buffered:{length:1,end:()=>20}};
+  h.context.activeQQTrackLiveRef.current=current;h.context.musicAudioRef.current=audio;
+  h.context.playQueueRef.current=[current,next,{mid:"third"},{mid:"fourth"}];
+  h.context.prepareTrack=async()=>({playback:{url:"qa://next"},audio:{duration:240},coverData:""});
+  h.context.transitionPairKey=(a,b)=>`${a}:${b}`;h.context.transitionPlansRef={current:new Map()};
+  h.context.transitionSequenceRef={current:0};h.context.seamlessAttemptedRef={current:"adopted"};
+  const plans=[];h.context.planTransition=(a,b)=>{plans.push([a.trackId,b.trackId]);return{id:"pair"};};
+  h.handlers.prepareUpcomingTrack(current.mid);await flush();
+  assert.deepEqual(plans,[],"do not snapshot a null current analysis while the job is pending");
+  await h.time.advance(500);await flush();
+  assert.ok(h.fetches.some(entry=>entry.url==="qa://adopted"));assert.ok(h.fetches.some(entry=>entry.url==="qa://next"));
+  assert.deepEqual(plans,[["adopted","next"]]);h.cleanup();
 });
 
 test("unmount aborts pending downloads and prevents late context or Worker creation", async () => {
@@ -297,4 +348,30 @@ test("unmount cancels source warming and releases blob URLs, preserving external
   h.context.bufferedSourcesRef.current.set("one", { url: "blob:one" }); h.context.bufferedSourcesRef.current.set("two", { url: "blob:two" });
   h.cleanup(); assert.equal(warm.controller.signal.aborted, true); assert.equal(warm.revision, 1);
   assert.deepEqual(h.revoked, ["blob:one", "blob:two"]); assert.equal(h.context.bufferedSourcesRef.current.size, 0);
+});
+
+test("cancelling all posted analysis interrupts abandoned Worker CPU work, but one valid shared job keeps it alive", async () => {
+  const h = harness({ worker: true }), a = new AbortController(), b = new AbortController();
+  const first = h.handlers.analyzeDecodedBuffer("old", h.buffer, signature, a.signal);
+  const second = h.handlers.analyzeDecodedBuffer("needed", h.buffer, signature, b.signal);
+  const worker = h.workers[0]; assert.equal(worker.messages.length, 2);
+  a.abort(); assert.equal(await first, null); assert.equal(worker.terminated, false);
+  assert.equal(h.context.analysisWorkerPendingRef.current.size, 1);
+  b.abort(); assert.equal(await second, null); assert.equal(worker.terminated, true);
+  assert.equal(h.context.analysisWorkerRef.current, null); assert.equal(h.time.jobs.size, 0);
+  const next = h.handlers.analyzeDecodedBuffer("new", h.buffer, signature);
+  assert.equal(h.workers.length, 2); const current = h.workers[1], message = current.messages[0];
+  worker.onmessage({ data: { id: worker.messages[0].id, analysis: analysis("old") } });
+  assert.equal(h.context.analysisWorkerPendingRef.current.size, 1, "Late retired-worker output cannot finish the new job");
+  current.onmessage({ data: { id: message.id, analysis: analysis("new") } });
+  assert.equal((await next).trackId, "new"); assert.equal(current.terminated, false, "Successful work retains the reusable Worker");
+  h.cleanup();
+});
+
+test("the last posted analysis deadline terminates the otherwise orphaned Worker and removes its timers", async () => {
+  const h = harness({ worker: true });
+  const pending = h.handlers.analyzeDecodedBuffer("timeout", h.buffer, signature);
+  await h.time.advance(45_000); assert.equal(await pending, null);
+  assert.equal(h.workers[0].terminated, true); assert.equal(h.context.analysisWorkerPendingRef.current.size, 0);
+  assert.equal(h.context.analysisWorkerRef.current, null); assert.equal(h.time.jobs.size, 0); h.cleanup();
 });

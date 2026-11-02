@@ -33,7 +33,23 @@ function hasExplicitRatingIntent(value: string, rating: "like" | "dislike") {
   const dislikes = /(?:不喜欢|不好听|讨厌|难听|\b(?:dislike|hate)\b|\b(?:don't|do not|never)\s+(?:really\s+)?(?:like|love|enjoy)\b)/i.test(text);
   if (rating === "dislike") return dislikes;
   if (dislikes || /(?:不|没|并不|不是|不太|谈不上|说不上).{0,5}(?:喜欢|好听|不错|爱|\blike\b)/i.test(text)) return false;
-  return /(?:喜欢|不错|好听|收藏|点赞|\b(?:like|love|enjoy|prefer|favo[u]?rite)\b|\bfell\s+in\s+love\s+with\b)/i.test(text);
+  return /(?:喜欢|不错|好听|收藏|点赞|迷上|沉迷|上头|\b(?:like|love|enjoy|prefer|favo[u]?rite)\b|\baddicted\s+to\b|\bfell\s+in\s+love\s+with\b)/i.test(text);
+}
+
+// Conversational permission, not another preference store or local executor.
+// A connection confirmation can resume only one recent, unresolved request.
+export function preferencePermissionForTurn(text: string, pending: { text: string; expiresAt: number } | null, now = Date.now()) {
+  const compact = text.trim().replace(/[\s！!。.,，]+/g, "").replace(/[啊呀呢吧]$/, "");
+  const reconnectReply = /^(?:我)?(?:已经|现在|刚刚|刚才)?(?:连上|连接好|登录|登陆)(?:了)?(?:QQ音乐|QQ|音乐)?(?:了)?$/i.test(compact)
+    || /^(?:QQ音乐|QQ)(?:已经|现在)?(?:连上|连接好|登录|登陆)了$/i.test(compact)
+    || /^(?:现在|这次)?(?:可以了|好了|再试一次|再试试|继续刚才的|继续刚才的偏好)$/.test(compact)
+    || /^(?:(?:i(?:'ve| have)?|it(?:'s| is))\s+)?(?:(?:already|now)\s+)?(?:connected|logged in)(?:\s+(?:to\s+)?qq(?: music)?)?(?:\s+now)?[.!]*$|^(?:try again|retry)[.!]*$/i.test(text.trim());
+  if (reconnectReply && pending && pending.expiresAt > now) return { text: pending.text, pending };
+  const personal = /(?:我|本人)|\bi(?:'m| am)?\b/i.test(text)
+    && !/[?？“”「」『』"]|(?:他说|她说|朋友说|别人说)|\b(?:he|she|they|my friend)\b/i.test(text)
+    && !/(?:别|不要|取消|撤销).{0,8}(?:记录|保存|记住)|\b(?:don't|do not)\s+(?:save|record|remember)\b/i.test(text)
+    && (hasExplicitRatingIntent(text, "like") || hasExplicitRatingIntent(text, "dislike"));
+  return { text, pending: personal ? { text, expiresAt: now + 10 * 60 * 1000 } : null };
 }
 
 function hasPlaybackIntent(value: string, action: "play" | "pause" | "next" | "previous") {
@@ -134,17 +150,29 @@ function hasArtistPreferenceIntent(text: string, artist: string, value: "more" |
   const namedTracks = searchResults.filter((track) => mentions(text, baseTitle(track.title)));
   const verifiedTracks = namedTracks.length ? namedTracks : searchResults;
   if (!uniquelyNamedArtist(text, artist, verifiedTracks)) return false;
-  return preferenceClauses(text).some((clause) => {
+  const clauses = preferenceClauses(text);
+  return clauses.some((clause, index) => {
     const prefix = artistPrefixInText(clause, artist);
     const directName = prefix && new RegExp(`(?:喜欢|爱|讨厌)\\s*${prefix.replace(/[.*+?^${}()|[\]\\]/g, "\\$&")}\\s*(?:$|[.!?。！？])`, "i").test(clause);
-    const englishScope = prefix && (new RegExp(`${prefix.replace(/[.*+?^${}()|[\]\\]/g, "\\$&")}(?:['’]s)?\\s+(?:music|songs|work)\\b`, "i").test(clause)
-      || new RegExp(`\\b(?:like|love|enjoy|prefer|fell\\s+in\\s+love\\s+with)\\s+${prefix.replace(/[.*+?^${}()|[\]\\]/g, "\\$&")}\\s*[.!]*$`, "i").test(clause));
+    const englishScope = prefix && (new RegExp(`${prefix.replace(/[.*+?^${}()|[\]\\]/g, "\\$&")}(?:['’]s)?\\s+(?:music|songs|work|style|sound|flow)\\b`, "i").test(clause)
+      || new RegExp(`\\b(?:like|love|enjoy|prefer|addicted\\s+to|fell\\s+in\\s+love\\s+with)\\s+${prefix.replace(/[.*+?^${}()|[\]\\]/g, "\\$&")}(?:\\s+(?:recently|lately))?\\s*[.!]*$`, "i").test(clause));
+    const referringStyle = index > 0 && artistPrefixInText(clauses[index - 1], artist)
+      && /\b(?:her|his|their)\s+(?:music|songs|style|sound|flow)\b|(?:他|她|他们|她们)的(?:歌|音乐|作品|风格|唱腔|声音)/i.test(clause);
     const broadScope = englishScope || /(?:的歌|的作品|这个歌手|这位歌手|这名歌手)|(?:其他|别的).{0,4}(?:他|她|其)(?:的)?歌/.test(clause)
       || (artistPrefixInText(clause, artist) && /(?:其他|别的|所有|全部|每首).{0,4}歌/.test(clause))
       || /(?:喜欢|爱|讨厌).{0,8}(?:这个歌手|这位歌手|这名歌手)/.test(clause)
-      || directName;
+      || directName || referringStyle;
     return broadScope && hasExplicitRatingIntent(clause, value === "more" ? "like" : "dislike");
   });
+}
+
+// Let the model interpret natural wording, but require a verbatim user span.
+// This is provenance/scope validation, not another synonym-based intent model.
+function preferenceEvidence(text: string, evidence: unknown) {
+  if (typeof evidence !== "string" || !evidence.trim() || evidence.length > 400 || !text.includes(evidence)) return false;
+  return !/[?？“”「」『』"]|(?:他说|她说|朋友说|别人说|如果|假如|例如|比如|转述)|\b(?:if|said|says|suppose|my friend)\b/i.test(evidence)
+    && !/^(?:我(?:刚刚|刚才|现在|最近)?(?:正在听|在听|听了|播放了|搜了|搜索了)|i\s+(?:(?:am|was|just|have|been|currently)\s+)*(?:listening to|listened to|played|searched for))[^，,；;。.!?？]+[。.!]*$/i.test(evidence.trim())
+    && !/(?:不要|别|不用|无需|取消|撤销).{0,12}(?:记录|保存|记住|偏好)|\b(?:don't|do not)\s+(?:save|record|remember)\b/i.test(text);
 }
 
 export function validateCodioToolCall(call: AgentToolCall, state: CodioToolPolicyState) {
@@ -194,28 +222,38 @@ export function validateCodioToolCall(call: AgentToolCall, state: CodioToolPolic
     const value = String(args.value || "");
     const artistName = typeof args.artist_name === "string" ? args.artist_name.toLocaleLowerCase() : "";
     if (/[?？]|(?:他说|她说|朋友说|别人说|转述|这句话)|\b(?:he|she|they|my friend)\s+(?:said|says|likes|loves)\b|\b(?:don't|do not)\s+(?:save|record|remember)\b/i.test(state.userText)) return "PREFERENCE_REQUIRES_EXPLICIT_USER_INTENT";
-    const temporaryOnly = /^(?:今晚|这会|暂时|tonight\b|today\b|right now\b|for now\b)/i.test(state.userText.trim());
+    const temporaryOnly = /(?:今晚|这会|暂时|这次|接下来|此刻)|\b(?:tonight|today|right now|for now|temporarily)\b/i.test(state.userText);
+    const evidence = args.evidence_text;
+    if (evidence !== undefined && !preferenceEvidence(state.userText, evidence)) return "INVALID_PREFERENCE_EVIDENCE";
+    if (typeof evidence === "string" && hasExplicitRatingIntent(evidence, value === "more" ? "dislike" : "like")
+      && !hasExplicitRatingIntent(evidence, value === "more" ? "like" : "dislike")) return "PREFERENCE_REQUIRES_EXPLICIT_USER_INTENT";
     if (!["more", "less"].includes(value)) return "PREFERENCE_REQUIRES_EXPLICIT_USER_INTENT";
     if (type === "feature") {
-      if (Object.keys(args).some(key => !["target_type", "feature_key", "value"].includes(key)) || args.feature_key !== "instrumental") return "INVALID_PREFERENCE_FEATURE";
+      if (Object.keys(args).some(key => !["target_type", "feature_key", "value", "evidence_text"].includes(key)) || args.feature_key !== "instrumental") return "INVALID_PREFERENCE_FEATURE";
+      if (!temporaryOnly && typeof evidence === "string" && /纯音乐|器乐|无(?:人声|演唱)|\binstrumental(?:s| music)?\b/i.test(evidence)) return null;
       return hasInstrumentalPreferenceIntent(state.userText, value as "more" | "less") ? null : "PREFERENCE_REQUIRES_EXPLICIT_USER_INTENT";
     }
     if (type === "track") {
-      if (Object.keys(args).some(key => !["target_type", "track_id", "value"].includes(key)) || typeof args.track_id !== "string" || !args.track_id.trim() || args.track_id.length > 128) return "INVALID_TOOL_ARGUMENTS";
+      if (Object.keys(args).some(key => !["target_type", "track_id", "value", "evidence_text"].includes(key)) || typeof args.track_id !== "string" || !args.track_id.trim() || args.track_id.length > 128) return "INVALID_TOOL_ARGUMENTS";
       const track = state.searchResultTracks?.find((item) => item.id === args.track_id);
       if (!track || !state.searchResultIds.includes(track.id)) return "TRACK_ID_NOT_FROM_THIS_TURN";
       if (temporaryOnly) return "PREFERENCE_REQUIRES_EXPLICIT_USER_INTENT";
       const verificationError = verifyNamedTrackPreference(state.userText, track, state.searchResultTracks || []);
       if (verificationError) return verificationError;
+      if (typeof evidence === "string" && mentions(evidence, baseTitle(track.title))) return null;
       return hasTargetPreferenceIntent(state.userText, track.title, value as "more" | "less") ? null : "PREFERENCE_REQUIRES_EXPLICIT_USER_INTENT";
     }
     if (type === "artist") {
-      if (Object.keys(args).some(key => !["target_type", "artist_name", "value"].includes(key)) || typeof args.artist_name !== "string" || !args.artist_name.trim() || args.artist_name.length > 120) return "INVALID_TOOL_ARGUMENTS";
+      if (Object.keys(args).some(key => !["target_type", "artist_name", "value", "evidence_text"].includes(key)) || typeof args.artist_name !== "string" || !args.artist_name.trim() || args.artist_name.length > 120) return "INVALID_TOOL_ARGUMENTS";
       if (!artistName || !(state.searchResultArtists || []).some((name) => name.toLocaleLowerCase() === artistName)) return "ARTIST_NOT_FROM_THIS_TURN";
       if (temporaryOnly) return "PREFERENCE_REQUIRES_EXPLICIT_USER_INTENT";
       const namedTracks = (state.searchResultTracks || []).filter((track) => mentions(state.userText, baseTitle(track.title)));
       const verifiedTracks = namedTracks.length ? namedTracks : state.searchResultTracks || [];
       if (matchingArtistsForPrefix(state.userText, String(args.artist_name), verifiedTracks).length > 1) return "AMBIGUOUS_ARTIST";
+      // A song-only opinion cannot be promoted to the whole artist merely by
+      // quoting the sentence. Artist-level wording must itself be in the span.
+      if (typeof evidence === "string" && uniquelyNamedArtist(evidence, String(args.artist_name), verifiedTracks)
+        && !verifiedTracks.some(track => mentions(evidence, baseTitle(track.title)))) return null;
       return hasArtistPreferenceIntent(state.userText, String(args.artist_name), value as "more" | "less", state.searchResultTracks || []) ? null : "PREFERENCE_REQUIRES_EXPLICIT_USER_INTENT";
     }
     return "INVALID_PREFERENCE_TARGET";
@@ -226,7 +264,7 @@ export function validateCodioToolCall(call: AgentToolCall, state: CodioToolPolic
     if ("familiarity" in args && !["familiar", "balanced", "explore"].includes(String(args.familiarity))) return "INVALID_SESSION_INTENT";
     if ("energy" in args && !["calm", "balanced", "energetic"].includes(String(args.energy))) return "INVALID_SESSION_INTENT";
     if ("flow" in args && !["continuous", "balanced", "varied"].includes(String(args.flow))) return "INVALID_SESSION_INTENT";
-    return /现在|今晚|此刻|这会|今天|当前|接下来|想听|来点|放点/i.test(state.userText) ? null : "SESSION_INTENT_REQUIRES_USER_INTENT";
+    return /现在|今晚|此刻|这会|今天|当前|接下来|想听|来点|放点|\b(?:tonight|today|right now|for now|want to hear|want to listen|in the mood)\b/i.test(state.userText) ? null : "SESSION_INTENT_REQUIRES_USER_INTENT";
   }
   if (call.name === "refresh_recommendations") return Object.keys(args).length ? "INVALID_RECOMMENDATION_REFRESH" : /(?:不要|别|不用|无需|不想).{0,8}(?:刷新|换一批|重新推荐)/.test(state.userText) || !/刷新|换一批|重新推荐|\brefresh\b/i.test(state.userText) ? "REFRESH_REQUIRES_USER_INTENT" : null;
   if (call.name === "update_interface") {
@@ -286,12 +324,14 @@ function toolFailureMessage(error: unknown) {
     case "TRACK_NOT_NAMED_BY_USER": return "搜索结果与提到的歌曲没有对上，偏好没有保存";
     case "PROFILE_NOT_READY": return "声音画像还没加载好，偏好没有保存";
     case "PREFERENCE_REQUIRES_EXPLICIT_USER_INTENT": return "这句话没有明确的喜欢或不喜欢，相关偏好没有保存";
+    case "INVALID_PREFERENCE_EVIDENCE": return "偏好的依据没有与原话核对上，相关偏好没有保存";
     case "INVALID_PREFERENCE_FEATURE": return "这类偏好目前没有可靠的歌曲分类支持，偏好没有保存";
     case "INVALID_PREFERENCE_TARGET":
     case "INVALID_TOOL_ARGUMENTS": return "偏好操作的参数没有通过校验，相关偏好没有保存";
     case "REFRESH_REQUIRES_USER_INTENT": return "你没有要求刷新，所以当前推荐没有更换";
     case "TRACK_PLAYBACK_FAILED": return "歌曲没有成功开始播放";
     case "QQ_NOT_CONNECTED": return "QQ 音乐尚未连接，无法核对歌曲";
+    case "QQ_STATUS_UNAVAILABLE": return "暂时无法确认 QQ 音乐的当前状态，相关偏好没有保存；不是已确认掉线，也不需要先重新登录";
     case "SEARCH_UNAVAILABLE": return "当前无法搜索歌曲，偏好没有保存";
     case "TOOL_EXECUTION_FAILED": return "本地操作失败，没有确认生效";
     case "DUPLICATE_TOOL_CALL_ID": return "重复操作已拦截";
@@ -315,9 +355,12 @@ function summarizeToolOutcomes(outcomes: ToolOutcome[], disconnected = false, us
     const allUpdated = saved.every(({ result }) => result.profileUpdated === true && ["queued", "pending_queue"].includes(String(result.recommendationEffect)));
     const latest = saved.map(({ result }) => result.recommendationUpdate as Record<string, unknown> | undefined);
     const committed = latest.some(update => update?.hiddenQueueCommitted === true);
+    const poolCommitted = latest.some(update => update?.hiddenPoolCommitted === true && Number(update.hiddenCandidateCount) > 0);
     const terminal = latest.some(update => ["completed", "failed", "insufficient_candidates"].includes(String(update?.status)));
     parts.push(committed && saved.every(({ result }) => result.profileUpdated === true)
       ? `已记下你${feedback}，画像已更新；未展示的推荐队列已提交。当前可见的 24 首保持不变，按 REFRESH 才换一批。`
+      : poolCommitted && saved.every(({ result }) => result.profileUpdated === true)
+      ? `已记下你${feedback}，画像已更新；未展示的推荐候选已按最新偏好重排。当前播放队列没有改动，可见的 24 首按 REFRESH 才更换。`
       : terminal && saved.every(({ result }) => result.profileUpdated === true)
       ? `已记下你${feedback}，画像已更新；这次重排未能提交新的待播队列，偏好仍会保留。当前可见的 24 首没有更换。`
       : allUpdated
@@ -358,7 +401,8 @@ function finalAgentReply(content: string, outcomes: ToolOutcome[], userText: str
   const persisted = outcomes.some(({ name, result }) => name === "record_music_preference" && result.ok === true && result.persisted === true);
   const profileUpdated = outcomes.some(({ result }) => result.ok === true && result.profileUpdated === true);
   const played = outcomes.some(({ name, result }) => result.ok === true && (name === "play_search_result" || name === "control_playback" && (result.after as Record<string, unknown> | undefined)?.playing === true));
-  const committed = outcomes.some(({ result }) => result.ok === true && (result.recommendationUpdate as Record<string, unknown> | undefined)?.hiddenQueueCommitted === true);
+  const committed = outcomes.some(({ result }) => result.ok === true && ((result.recommendationUpdate as Record<string, unknown> | undefined)?.hiddenQueueCommitted === true
+    || (result.recommendationUpdate as Record<string, unknown> | undefined)?.hiddenPoolCommitted === true));
   const contradiction = !persisted && /(?:已(?:经)?|成功).{0,8}(?:保存|记下|记住|记录).{0,8}(?:偏好|喜欢|不喜欢)|偏好.{0,6}(?:已(?:经)?|成功)(?:保存|更新|调整)/.test(text)
     || !profileUpdated && /画像.{0,6}(?:已(?:经)?|成功)(?:保存|更新|调整)|(?:已(?:经)?|成功).{0,5}(?:更新|调整).{0,5}画像/.test(text)
     || !played && /(?:已(?:经)?|成功).{0,6}(?:开始播放|播放了|播放歌曲)/.test(text)

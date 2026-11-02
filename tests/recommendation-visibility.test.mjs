@@ -7,7 +7,7 @@ import ts from "typescript";
 const source = await readFile(new URL("../app/RadioExperience.tsx", import.meta.url), "utf8");
 const ast = ts.createSourceFile("RadioExperience.tsx", source, ts.ScriptTarget.Latest, true, ts.ScriptKind.TSX);
 const handlerNames = ["readStartupRecommendationSnapshot", "buildStartupRecommendationSnapshot", "recommendationIdentity", "recommendationArtistMatches", "updateListeningMemory", "requestRecommendationUpdate", "releaseStartupRecommendations", "enrichTrackMetadata", "featureVectorForTrack", "writeTrackPreference", "candidateForExperiment",
-  "rememberExperiment", "recordCurrentPreference", "updateTonightIntent", "correctProfileHypothesis", "withdrawPreference", "refreshRecommendationLane", "refreshRecommendations", "recommendationQueueFor", "recommendationSourceForTrack", "syncQQTaste"];
+  "rememberExperiment", "recordCurrentPreference", "updateTonightIntent", "correctProfileHypothesis", "withdrawPreference", "refreshRecommendationLane", "refreshRecommendations", "recommendationQueueFor", "recommendationSourceForTrack", "syncQQTaste", "executeCodioTool", "waitForRecommendationUpdate"];
 const declarations = new Map();
 let memoryEffect, startupReleaseEffect;
 function visit(node) {
@@ -26,6 +26,7 @@ assert.ok(startupReleaseEffect, "actual QQ/library startup barrier");
 const transpile = (code, module = ts.ModuleKind.None) => ts.transpileModule(code, { compilerOptions: { target: ts.ScriptTarget.ES2022, module } }).outputText;
 const bindHandlers = new Function("context", `with(context){${transpile(handlerNames.map(name=>declarations.get(name)).join("\n") + "\nconst hydratePreferences=" + memoryEffect + ";\nconst releaseStartupEffect=" + startupReleaseEffect + ";")} return {${handlerNames.join(",")},hydratePreferences,releaseStartupEffect};}`);
 const intelligence = await import(`data:text/javascript;base64,${Buffer.from(transpile(await readFile(new URL("../app/listening-intelligence.ts",import.meta.url),"utf8"),ts.ModuleKind.ES2022)).toString("base64")}`);
+const agent = await import(`data:text/javascript;base64,${Buffer.from(transpile(await readFile(new URL("../app/codio-agent.ts",import.meta.url),"utf8"),ts.ModuleKind.ES2022)).toString("base64")}`);
 const identity = item => item.mid || item.id ? intelligence.canonicalTrackKey(item.provider || "qq", item.mid || item.id) : `${item.title.trim().toLowerCase()}::${item.artist.trim().toLowerCase()}`;
 const fixtures = Array.from({length:72},(_,index)=>({title:`Track ${index}`,artist:`Artist ${index}`,reason:"Test candidate",color:"blue",cover:"",tags:[`tag-${index%8}`],energy:.3,novelty:.2,night:.5}));
 const qqTrack = item => ({provider:"qq",id:item.title,mid:item.title,title:item.title,artist:item.artist,durationSeconds:240,cover:""});
@@ -127,6 +128,94 @@ test("qualified manual refresh separates close new songs from credible broader e
     assert.ok(queue.every(track=>(Number(track.mid.replace("Track ",""))<48)===(lane==="matched")));
   }
   const before=h.shown(); h.visibleWrites.length=0; h.handlers.recordCurrentPreference("like");await h.flush();assertStable(h,{...before});
+});
+
+test("third and later refresh replenish the same lane beyond exhausted search pages without recycling exposure", async () => {
+  const h=qualifiedLaneHarness(),other=h.shown().frontier,batches=[];
+  const makePage=page=>Array.from({length:24},(_,i)=>({provider:"qq",id:`page-${page}-${i}`,mid:`page-${page}-${i}`,title:`Work ${page}-${i}`,artist:`Page artist ${i%12}`,
+    genres:["neo-soul"],language:"英语",releaseDate:"2024-01-01",durationSeconds:240,cover:"test:cover"}));
+  h.context.window.codioDesktop.qqMusic.search=async(query,page)=>{
+    h.searchCalls.push({query,page});
+    return query==="neo-soul"?makePage(page<10?0:page):[];
+  };
+  for(let i=0;i<5;i++){
+    const result=await h.handlers.refreshRecommendations("manual",undefined,["manual"],"match");
+    const record=result.lanes[0];
+    assert.equal(record.status,"completed",`refresh ${i+1}`);assert.equal(record.visibleCommitted,true);
+    const ids=h.shown().matched.map(identity);assert.equal(ids.length,12);batches.push(ids);
+    assert.strictEqual(h.shown().frontier,other,"only this lane may refresh");
+    if(i===2)assert.ok(record.acquisitionPasses>=2,"the exhausted third request must actually retrieve another seed window");
+  }
+  assert.equal(new Set(batches.flat()).size,60,"no old page or exposure is silently recycled");
+  assert.ok(h.context.recommendationPoolsRef.current.match.cursor>5,"persist the refill cursor, not just the click count");
+});
+
+test("real DJ preference saves, changes final scores and commits the hidden queue even when provider search is offline", async () => {
+  const h=qualifiedLaneHarness();
+  await h.handlers.refreshRecommendations("manual");
+  const shown=h.shown();
+  const prefix=[h.context.activeQQTrackLiveRef.current,...[...shown.matched,...shown.frontier].map(item=>h.context.recommendationTracksRef.current[identity(item)])].map(track=>track.mid);
+  h.context.playQueueRef.current=prefix.map(mid=>h.context.recommendationTracksRef.current[`qq:${mid}`]);
+  h.visibleWrites.length=0;
+  const key=h.context.recommendationPoolsRef.current.match.hidden[0],track=h.context.recommendationTracksRef.current[key];
+  assert.ok(track,"use an actual source-checked hidden candidate");
+  Object.assign(h.context,agent,{setThinkingCue(){},qqConnection:"connected",qqPlaybackReady:true,
+    scene:"night",particleLevel:2,lyricMode:"cinematic",profileOpen:false,settingsOpen:false,nowPlayingOpen:false,djOpen:true,
+    crypto:{randomUUID:()=>`dj-${Math.random()}`}});
+  const before=h.context.recommendationScoresRef.current.get(key).totalScore;
+  const text=`${track.title}这首不合我口味`;
+  const result=await h.handlers.executeCodioTool({id:"saved",name:"record_music_preference",arguments:{target_type:"track",track_id:track.mid,value:"less",evidence_text:text}},new Map([[track.mid,track]]),text);
+  assert.equal(result.persisted,true);assert.equal(result.profileUpdated,true);assert.equal(result.recommendationUpdate.status,"queued");
+  let attemptedSearches=0;
+  h.context.window.codioDesktop.qqMusic.search=async()=>{attemptedSearches++;throw Error("offline retrieval must not block re-ranking owned candidates");};
+  await h.flush();
+  const update=h.context.recommendationUpdateRef.current.latest;
+  assert.equal(attemptedSearches,0);assert.equal(update.status,"completed");
+  assert.ok(update.lanes.every(lane=>lane.rerankOwnedPool===true));
+  assert.equal(update.hiddenPoolCommitted,true);assert.equal(update.hiddenQueueCommitted,true);assert.equal(update.hiddenPoolChanged,true);
+  assert.ok(h.context.recommendationScoresRef.current.get(key).totalScore<before);
+  assert.ok(h.context.recommendationScoresRef.current.get(key).contributions.find(item=>item.key==="explicit_track").signedWeight<0);
+  assert.ok(!h.context.recommendationPoolsRef.current.match.hidden.includes(key));
+  assert.ok(!h.context.playQueueRef.current.slice(prefix.length).some(item=>item.mid===track.mid));
+  assert.deepEqual(h.context.playQueueRef.current.slice(0,prefix.length).map(track=>track.mid),prefix);
+  assertStable(h,shown);
+  const saved=intelligence.activePreferences(intelligence.loadListeningMemory(h.context.window.localStorage));
+  assert.equal(saved.find(event=>event.targetKey===key).source,"dj");
+});
+
+test("DJ completion observes the real update event, with bounded wait and no polling", async () => {
+  const h=qualifiedLaneHarness(),update=h.context.recommendationUpdateRef.current;
+  update.waiters=new Set();update.latest={revision:1,status:"queued"};
+  let completed=false;const wait=h.handlers.waitForRecommendationUpdate(1).then(()=>{completed=true;});
+  await turn();assert.equal(completed,false);assert.equal(update.waiters.size,1);
+  update.latest={revision:1,status:"completed",hiddenPoolCommitted:true};update.waiters.forEach(done=>done());await wait;
+  assert.equal(completed,true);assert.equal(update.waiters.size,0);
+  assert.equal(h.timers.at(-1).cancelled,true);
+  update.latest={revision:2,status:"queued"};const slow=h.handlers.waitForRecommendationUpdate(2);
+  h.timers.at(-1).callback();await slow;
+  assert.equal(update.latest.status,"queued","timeout is not fabricated completion");assert.equal(update.waiters.size,0);
+});
+
+test("a newly declared artist has a real bounded exploration acquisition route, not just a chat memory", async () => {
+  const h=qualifiedLaneHarness();await h.handlers.refreshRecommendations("manual");
+  const shown=h.shown();h.visibleWrites.length=0;
+  Object.assign(h.context,agent,{setThinkingCue(){},qqConnection:"connected",qqPlaybackReady:true,
+    scene:"night",particleLevel:2,lyricMode:"cinematic",profileOpen:false,settingsOpen:false,nowPlayingOpen:false,djOpen:true,
+    crypto:{randomUUID:()=>`artist-${Math.random()}`}});
+  const track={provider:"qq",mid:"new-artist-verified-work",id:"new-artist-verified-work",title:"Verified new work",artist:"Verified New Artist",durationSeconds:240,cover:"test:cover"};
+  const text="Verified New Artist的歌太对我胃口了";
+  const saved=await h.handlers.executeCodioTool({id:"artist",name:"record_music_preference",arguments:{target_type:"artist",artist_name:track.artist,value:"more",evidence_text:text}},new Map([[track.mid,track]]),text);
+  assert.equal(saved.persisted,true);
+  h.context.window.codioDesktop.qqMusic.search=async(query,page)=>{h.searchCalls.push({query,page});return query===track.artist?[track]:[];};
+  h.context.window.codioDesktop.qqMusic.metadata=async mid=>({ok:true,mid,source:"provider_metadata",genres:[]});
+  await h.flush();
+  const record=h.context.recommendationUpdateRef.current.latest.lanes.find(item=>item.lane==="frontier");
+  assert.ok(record.seeds.some(seed=>seed.strategy==="explicit_artist_trial"&&seed.query===track.artist));
+  assert.ok(record.hiddenIds.includes(`qq:${track.mid}`));
+  const score=h.context.recommendationScoresRef.current.get(`qq:${track.mid}`);
+  assert.equal(score.laneEvidence.match,false,"an artist name does not prove close sonic match");
+  assert.equal(score.laneEvidence.frontier,true);assert.ok(score.contributions.find(item=>item.key==="explicit_artist").signedWeight>0);
+  assertStable(h,shown);
 });
 
 test("a qualified repeated refresh produces disjoint batches and preserves the last full batch on exhaustion",async()=>{
@@ -260,6 +349,31 @@ function assertStable(h, before) {
   assert.equal(h.shown().frontier.length, 12);
   assert.deepEqual(h.visibleWrites, [], "feedback must not write either visible batch");
 }
+
+test("completed reranks retire old disposable caches but preserve both visible batches, committed prefix and transition target", async () => {
+  const h = qualifiedLaneHarness(), before = h.shown(), memoryBefore = JSON.stringify(h.memory());
+  const active = h.context.activeQQTrackLiveRef.current;
+  const manual = { ...active, mid: "manual-protected", title: "Manual" }, promised = { ...active, mid: "promised-protected", title: "Promised" };
+  h.context.playQueueRef.current = [active, manual, promised, ...h.context.playQueueRef.current.filter(track => track.mid !== active.mid)];
+  h.context.manualQueueIdsRef.current.add(manual.mid);
+  h.context.activeTransitionRef.current = { outgoingSnapshot: { track: active }, incomingSnapshot: { track: promised } };
+  for (const track of [manual, promised]) h.context.recommendationTracksRef.current[identity(track)] = track;
+  for (let i = 0; i < 5000; i++) {
+    const track = { ...active, mid: `obsolete${i}` }, key = identity(track);
+    h.context.recommendationTracksRef.current[key] = track; h.context.discoveryTracksRef.current[key] = track;
+    h.context.recommendationScoresRef.current.set(key, { candidateKey: key, contributions: [] });
+  }
+  const result = await h.handlers.refreshRecommendations("feedback", undefined, ["runtime-cache-check"]);
+  assert.equal(result.status, "completed"); assertStable(h, before);
+  assert.deepEqual(h.context.playQueueRef.current.slice(0, 3).map(track => track.mid), [active.mid, manual.mid, promised.mid]);
+  for (const track of [active, manual, promised]) assert.equal(h.context.recommendationTracksRef.current[identity(track)].mid, track.mid);
+  assert.equal(h.context.recommendationTracksRef.current["qq:obsolete0"], undefined);
+  assert.equal(h.context.recommendationScoresRef.current.has("qq:obsolete0"), false);
+  assert.ok(Object.keys(h.context.recommendationTracksRef.current).length < 1600);
+  assert.ok(h.context.recommendationScoresRef.current.size < 1600);
+  assert.ok(Object.keys(h.context.discoveryTracksRef.current).length < 1600);
+  assert.equal(JSON.stringify(h.memory()), memoryBefore, "Transient cache retirement cannot edit listening memory");
+});
 
 function startupSnapshotHarness({failed=[],bootPhase="playing",memory}={}) {
   const h=qualifiedLaneHarness({memory}),owner="isolatedQQOwner",prepared=[];
@@ -1000,6 +1114,7 @@ test("artist discovery rejects unrelated title hits but retains the named artist
 
 test("QQ library discovery applies the same artist identity filter before requesting a rerank", async () => {
   const h=harness();h.context.discoveryBridgeArtists={adjacent:["Warpaint"]};
+  h.context.qqAuthorizationRevisionRef={current:0};
   const actual={...qqTrack(fixtures[0]),mid:"verified-warpaint",title:"Love Is To Die",artist:"Warpaint"};
   const unrelated={...actual,mid:"unrelated",title:"War Paint",artist:"Smokin Gunn"};
   h.context.window.codioDesktop.qqMusic.library=async()=>({playlists:[],tracks:[actual],playlistNames:[],likedCount:0,topArtists:[{name:"Warpaint",weight:1}]});

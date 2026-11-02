@@ -23,6 +23,7 @@ import {
   saveListeningMemory,
   supplementPreferenceFeatures,
   scoreCandidate,
+  prepareScoringEvidence,
   createRecommendationPool,
   recommendationAcquisitionSeeds,
   interleaveRecommendationSources,
@@ -43,7 +44,7 @@ import {
   type SessionIntent,
   type TrackFeatureVector,
 } from "./listening-intelligence";
-import { codioRequestFailure, didRequestedTrackStart, isOfflineCodioShortcut, runCodioAgentLoop, validateCodioToolCall, verifyNamedTrackPreference } from "./codio-agent";
+import { codioRequestFailure, didRequestedTrackStart, isOfflineCodioShortcut, preferencePermissionForTurn, runCodioAgentLoop, validateCodioToolCall, verifyNamedTrackPreference } from "./codio-agent";
 import LyricsScroller from "./LyricsScroller";
 import { buildListeningPresentation } from "./listening-presentation";
 import { loadLyricsWithRetry } from "./codio-requests";
@@ -259,6 +260,20 @@ const PREPARED_TRACK_TTL_MS = 3 * 60 * 1000;
 type CoverPoint = { nx: number; ny: number; rgb: [number, number, number]; alpha: number; seed: number; radius?: number; angle?: number };
 type CoverPointPair = { from: CoverPoint; to: CoverPoint };
 
+function createPointerAttractionTable(radius: number) {
+  // The force is radial: one small squared-distance table covers every mouse
+  // position. Quarter-pixel-squared (or finer) samples avoid sqrt/pow in the point loop;
+  // interpolation keeps slow pointer movement continuous, including the centre.
+  const factors = new Float32Array(radius > 0 ? Math.max(1025, Math.ceil(radius * radius * 4) + 1) : 2);
+  if (radius <= 0) return factors;
+  const squaredStep = radius * radius / (factors.length - 1);
+  for (let index = 0; index < factors.length; index += 1) {
+    const distance = Math.sqrt(index * squaredStep);
+    factors[index] = distance >= radius ? 0 : Math.pow(1 - distance / radius, 1.72) / Math.max(distance, 1);
+  }
+  return factors;
+}
+
 function setBoundedCache<K, V>(cache: Map<K, V>, key: K, value: V, limit: number) {
   cache.delete(key);
   cache.set(key, value);
@@ -363,7 +378,7 @@ type CodioDesktopBridge = {
     library: () => Promise<QQTrack[]>;
   };
   qqMusic: {
-    getStatus: () => Promise<QQDesktopStatus>;
+    getStatus: (options?: { recover?: boolean }) => Promise<QQDesktopStatus>;
     login: (options?: { forceAuthorization?: boolean }) => Promise<QQDesktopStatus>;
     logout: () => Promise<QQDesktopStatus>;
     search: (query: string, page?: number) => Promise<QQTrack[]>;
@@ -654,9 +669,10 @@ export function RadioExperience() {
   const recommendationAudioRef = useRef(new Map<string, Pick<TrackAnalysis, "bpm" | "tempoConfidence" | "outroFocus">>());
   const metadataEnrichmentRef = useRef({ active: 0, waiters: [] as Array<() => void>,
     pending: new Map<string, ReturnType<NonNullable<CodioDesktopBridge["qqMusic"]["metadata"]>>>() });
-  const recommendationUpdateRef = useRef({ revision: 0, timer: null as number | null, triggers: new Set<string>(), startupReady: false, latest: {} as Record<string, unknown>, records: [] as Record<string, unknown>[] });
+  const recommendationUpdateRef = useRef({ revision: 0, timer: null as number | null, triggers: new Set<string>(), startupReady: false, latest: {} as Record<string, unknown>, records: [] as Record<string, unknown>[], waiters: new Set<() => void>() });
   const recommendationVisibleRef = useRef({ matched: matchedExperiments, frontier: visibleExperiments });
   const manualQueueIdsRef = useRef(new Set<string>());
+  const queueSelectionRef = useRef<(track: QQTrack | (typeof tracks)[number], index: number) => void>(() => {});
   const recommendationRefreshRef = useRef<(trigger: "manual" | "feedback" | "sync", revision?: number, triggers?: string[], lane?: RecommendationLane) => Promise<Record<string, unknown>>>(async () => ({}));
   const [playedHistory, setPlayedHistory] = useState<PlayedTrack[]>([]);
   const [likedTracks, setLikedTracks] = useState<Set<string>>(new Set());
@@ -700,6 +716,7 @@ export function RadioExperience() {
     const update = recommendationUpdateRef.current;
     update.revision += 1;
     if (update.timer !== null) window.clearTimeout(update.timer);
+    update.waiters.forEach(done => done());
   }, []);
   const [, setLikedExperiments] = useState<Set<string>>(new Set());
   const [timeContext, setTimeContext] = useState("");
@@ -718,6 +735,7 @@ export function RadioExperience() {
   const weatherAutoStartedRef = useRef(false);
   const weatherSnapshotRef = useRef({ text: "", at: 0, revision: 0 });
   const [messages, setMessages] = useState<Message[]>([]);
+  const pendingDjPreferenceRef = useRef<{ text: string; expiresAt: number } | null>(null);
   const canvasRef = useRef<HTMLCanvasElement>(null);
   const visualActiveRef = useRef(true);
   const nowCanvasRef = useRef<HTMLCanvasElement>(null);
@@ -786,6 +804,7 @@ export function RadioExperience() {
   const coverPointCloudsRef = useRef(new Map<string, CoverPoint[]>());
   const coverPointPairsRef = useRef(new Map<string, CoverPointPair[]>());
   const particleRenderStridesRef = useRef(new Map<string, number>());
+  const pointerAttractionTableRef = useRef<{ radius: number; factors: Float32Array } | null>(null);
   const activeQQTrackLiveRef = useRef<QQTrack | null>(null);
   const currentCoverDataLiveRef = useRef("");
   const currentTrackCoverLiveRef = useRef("");
@@ -844,6 +863,19 @@ export function RadioExperience() {
   const nowPlayingQueue = activeQQTrack && playQueue.length ? playQueue : tracks;
   const djLibraryCount = qqTasteSnapshot?.tracks.length || qqSummary.recent;
   const derivedProfile = useMemo(() => deriveListeningProfile(listeningMemory, Math.max(profileClock, listeningMemory.updatedAt)), [listeningMemory, profileClock]);
+  const familiarRecommendationIds = useMemo(() => {
+    const ids = new Set(qqTasteSnapshot?.tracks.map(track => canonicalTrackKey(track.provider || "qq", track.mid)) || []);
+    const now = Math.max(profileClock, listeningMemory.updatedAt);
+    for (const item of [...matchedExperiments, ...visibleExperiments]) {
+      const track = recommendationTracks[recommendationIdentity(item)];
+      if (!track) continue;
+      const key = canonicalTrackKey(track.provider || "qq", track.mid);
+      if (ids.has(key)) continue;
+      const status = listeningStatus(listeningMemory, key, now);
+      if (status.effective || status.liked) ids.add(key);
+    }
+    return ids;
+  }, [listeningMemory, profileClock, qqTasteSnapshot, matchedExperiments, visibleExperiments, recommendationTracks]);
   const listeningPresentation = useMemo(() => buildListeningPresentation(listeningMemory, derivedProfile, {
     now: Math.max(profileClock, listeningMemory.updatedAt),
     recommendationUpdate: recommendationLoading.match || recommendationLoading.frontier
@@ -1156,7 +1188,8 @@ export function RadioExperience() {
 
   useEffect(() => {
     listeningMemoryRef.current = listeningMemory;
-    if (listeningMemoryHydratedRef.current) saveListeningMemory(window.localStorage, listeningMemory);
+    // Every mutation persists before publishing state. Do not serialize and
+    // synchronously write the same memory again after React commits it.
     const preferences = activePreferences(listeningMemory);
     setLikedTracks(new Set(preferences.filter((item) => item.targetType === "track" && item.value === "more").map((item) => item.targetKey)));
     setDislikedTracks(new Set(preferences.filter((item) => item.targetType === "track" && item.value === "less").map((item) => item.targetKey)));
@@ -1456,18 +1489,28 @@ export function RadioExperience() {
   const prepareInitialWaveformRef = useRef(prepareInitialWaveform);
   prepareInitialWaveformRef.current = prepareInitialWaveform;
   useEffect(() => {
-    if (bootPhase !== "playing" || !activeQQTrack || initialWaveformRef.current.trackId === activeQQTrack.mid) return;
+    if (!activeQQTrack || initialWaveformRef.current.trackId === activeQQTrack.mid) return;
     let disposed = false;
     setBootWaveformError(false);
-    void withTimeout(prepareInitialWaveformRef.current(activeQQTrack), 32000, "INITIAL_WAVEFORM").then(waveform => {
+    // Keep observing the real job after the UI wait deadline. The Worker has
+    // its own longer bound; a valid late result must still complete startup.
+    const preparation = prepareInitialWaveformRef.current(activeQQTrack).then(waveform => {
       if (disposed) return;
       if (!waveform) { setBootWaveformError(true); return; }
+      setBootWaveformError(false);
       initialWaveformRef.current = { trackId: activeQQTrack.mid, waveform };
-      displayedWaveformRef.current = [];
+      // First reveal uses the finished real curve. Later songs retain the
+      // existing morph instead of resetting the displayed line mid-handoff.
+      if (bootPhase !== "done" || !displayedWaveformRef.current.some(value => value > 0)) displayedWaveformRef.current = [];
       setWaveformRevision(revision => revision + 1);
     }).catch(() => { if (!disposed) setBootWaveformError(true); });
+    void withTimeout(preparation, 32000, "INITIAL_WAVEFORM").catch(() => {
+      // Offer retry without abandoning the original job. A valid later result
+      // above still clears this state and completes readiness automatically.
+      if (!disposed) setBootWaveformError(true);
+    });
     return () => { disposed = true; };
-  }, [activeQQTrack, bootPhase, bootAssetAttempt]);
+  }, [activeQQTrack, bootPhase, bootAssetAttempt, qqPlaybackReady]);
 
   useEffect(() => {
     const tracksToWarm = [...matchedExperiments, ...visibleExperiments]
@@ -1705,8 +1748,9 @@ export function RadioExperience() {
       const mix = sourceIndex - left;
       return (source[left] || 0) * (1 - mix) + (source[right] || source[left] || 0) * mix;
     });
-    if (!displayedWaveformRef.current.length) displayedWaveformRef.current = sampleWaveform(trackAnalysisRef.current.get(waveformKey)?.waveform
-      || (initialWaveformRef.current.trackId === waveformKey ? initialWaveformRef.current.waveform : fallbackWaveform));
+    const cachedWaveform = trackAnalysisRef.current.get(waveformKey)?.waveform;
+    if (!displayedWaveformRef.current.length) displayedWaveformRef.current = sampleWaveform(cachedWaveform?.length ? cachedWaveform
+      : initialWaveformRef.current.trackId === waveformKey ? initialWaveformRef.current.waveform : fallbackWaveform);
 
     const resize = () => {
       lastDrawnProgress = -1;
@@ -1723,8 +1767,9 @@ export function RadioExperience() {
       if (document.hidden || !visualActiveRef.current) return;
       const runtime = activeTransitionRef.current;
       const transitionFrame = transitionVisualFrameRef.current;
-      const ordinaryWaveform = sampleWaveform(trackAnalysisRef.current.get(waveformKey)?.waveform
-        || (initialWaveformRef.current.trackId === waveformKey ? initialWaveformRef.current.waveform : fallbackWaveform));
+      const analyzedWaveform = trackAnalysisRef.current.get(waveformKey)?.waveform;
+      const ordinaryWaveform = sampleWaveform(analyzedWaveform?.length ? analyzedWaveform
+        : initialWaveformRef.current.trackId === waveformKey ? initialWaveformRef.current.waveform : fallbackWaveform);
       const outgoingWaveform = runtime ? sampleWaveform(runtime.outgoingSnapshot.analysis.waveform || fallbackWaveform) : ordinaryWaveform;
       const incomingWaveform = runtime ? sampleWaveform(runtime.incomingSnapshot.analysis.waveform || fallbackWaveform) : ordinaryWaveform;
       const waveformMix = runtime && transitionFrame ? transitionFrame.waveformMix : 0;
@@ -1836,6 +1881,11 @@ export function RadioExperience() {
     let smoothedBurstEnvelope = 0;
     let suppressDramaticUntil = 0;
     let paintDirty = true;
+    let influenceRadiusSquared = 0;
+    let attractionFactors: Float32Array = new Float32Array(0);
+    let attractionScale = 0;
+    let paintedPointerX = NaN;
+    let paintedPointerY = NaN;
     let pausedFrame: { audio: HTMLAudioElement | null; time: number; track: string; cover: string; analysis: TrackAnalysis | undefined; x: number; y: number; rx: number; ry: number; zoom: number } | null = null;
     const pointRenderCache = new WeakMap<CoverPoint, { color: string; edgeFalloff: number; scatterJitter: number; scatterDepth: number; spatialSin: number; spatialCos: number; radialSin: number; radialCos: number }>();
     const rhythm = () => {
@@ -1924,6 +1974,15 @@ export function RadioExperience() {
       canvas.width = Math.floor(width * ratio);
       canvas.height = Math.floor(height * ratio);
       context.setTransform(ratio, 0, 0, ratio, 0, 0);
+      const radius = Math.min(126, Math.min(width, height) * .17);
+      influenceRadiusSquared = radius * radius;
+      if (!reducedMotion) {
+        if (pointerAttractionTableRef.current?.radius !== radius) {
+          pointerAttractionTableRef.current = { radius, factors: createPointerAttractionTable(radius) };
+        }
+        attractionFactors = pointerAttractionTableRef.current.factors;
+        attractionScale = influenceRadiusSquared > 0 ? (attractionFactors.length - 1) / influenceRadiusSquared : 0;
+      }
       renderQualityKey = `${grid}:${width}:${height}:${ratio}`;
       const cachedStride = particleRenderStridesRef.current.get(renderQualityKey);
       particleStride = cachedStride || 1;
@@ -1985,8 +2044,6 @@ export function RadioExperience() {
       const pointCount = particleTransition.length ? particleTransition.length : fallbackPoints.length;
       context.globalCompositeOperation = "source-over";
       const visualCenterX = width >= 900 && lyricMode === "minimal" ? width * .3 : width / 2;
-      const influenceRadius = Math.min(126, Math.min(width, height) * .17);
-      const influenceRadiusSquared = influenceRadius * influenceRadius;
       const strideSize = gap * Math.sqrt(particleStride);
       const timePhase = time * .00022;
       const sinTime = Math.sin(timePhase), cosTime = Math.cos(timePhase);
@@ -2049,12 +2106,13 @@ export function RadioExperience() {
           const deltaY = mouseY - y;
           const distanceSquared = deltaX * deltaX + deltaY * deltaY;
           if (distanceSquared < influenceRadiusSquared && !reducedMotion) {
-            const distance = Math.sqrt(distanceSquared);
-            const influence = Math.pow(1 - distance / influenceRadius, 1.72);
+            const sample = distanceSquared * attractionScale;
+            const index = Math.min(attractionFactors.length - 2, sample | 0);
+            const factor = attractionFactors[index] + (attractionFactors[index + 1] - attractionFactors[index]) * (sample - index);
             const depthLayer = Math.max(.28, Math.min(1.18, .7 + depth / Math.max(size, 1)));
-            const force = influence * (10 + depthLayer * 16 + music.breath * 3);
-            x += (deltaX / Math.max(distance, 1)) * force;
-            y += (deltaY / Math.max(distance, 1)) * force;
+            const force = factor * (10 + depthLayer * 16 + music.breath * 3);
+            x += deltaX * force;
+            y += deltaY * force;
           }
           context.fillStyle = transition ? `rgb(${Math.round(pointRgb[0])} ${Math.round(pointRgb[1])} ${Math.round(pointRgb[2])})` : cached.color;
           const edgeFalloff = transition ? Math.pow(Math.min(1, edge), 1.45) : cached.edgeFalloff;
@@ -2070,6 +2128,14 @@ export function RadioExperience() {
       frame = 0;
       if (document.hidden || !visualActiveRef.current) return;
       const pointer = nowPointerRef.current;
+      // High-rate pointer events only publish coordinates. Coalesce background
+      // style writes into this existing visible-frame loop, never a second rAF.
+      if (paintedPointerX !== pointer.x || paintedPointerY !== pointer.y) {
+        nowStageRef.current?.style.setProperty("--np-x", `${pointer.x * 18}px`);
+        nowStageRef.current?.style.setProperty("--np-y", `${pointer.y * 14}px`);
+        paintedPointerX = pointer.x;
+        paintedPointerY = pointer.y;
+      }
       const follow = reducedMotion ? 1 : pointer.dragging ? 0.5 : 0.18;
       pointer.visualX += (pointer.x - pointer.visualX) * follow;
       pointer.visualY += (pointer.y - pointer.visualY) * follow;
@@ -2405,6 +2471,7 @@ export function RadioExperience() {
       };
       analysisWorkerRef.current = worker;
     }
+    const worker = analysisWorkerRef.current;
     const id = `analysis-${trackKey}-${Date.now()}-${Math.random().toString(36).slice(2)}`;
     const channelBuffers = Array.from({ length: Math.min(8, buffer.numberOfChannels) }, (_, index) => new Float32Array(buffer.getChannelData(index)).buffer);
     return new Promise<TrackAnalysis | null>((resolve) => {
@@ -2416,13 +2483,22 @@ export function RadioExperience() {
         signal?.removeEventListener("abort", cancel);
         resolve(analysis);
       };
-      const cancel = () => finish(null);
+      const cancel = () => {
+        const pending = analysisWorkerPendingRef.current.has(id);
+        finish(null);
+        // Resolving a cancelled promise does not interrupt synchronous DSP in
+        // the Worker. Stop it only when no still-needed job shares the worker.
+        if (pending && !analysisWorkerPendingRef.current.size && analysisWorkerRef.current === worker) {
+          worker?.terminate();
+          analysisWorkerRef.current = null;
+        }
+      };
       const timer = window.setTimeout(cancel, 45_000);
       analysisWorkerPendingRef.current.set(id, { resolve: finish, timer });
       signal?.addEventListener("abort", cancel, { once: true });
       if (!analysisLifecycleRef.current.mounted || generation !== analysisLifecycleRef.current.generation || signal?.aborted) { cancel(); return; }
       try {
-        analysisWorkerRef.current!.postMessage({ id, trackId: trackKey, sampleRate: buffer.sampleRate, channels: channelBuffers, sourceSignature }, channelBuffers);
+        worker!.postMessage({ id, trackId: trackKey, sampleRate: buffer.sampleRate, channels: channelBuffers, sourceSignature }, channelBuffers);
       } catch { cancel(); }
     });
   }
@@ -2451,7 +2527,9 @@ export function RadioExperience() {
   function analyseTrackSource(trackKey: string, sourceUrl: string, mediaDuration = 0, sourceMediaId = "") {
     if (!analysisLifecycleRef.current.mounted) return Promise.resolve(null);
     const cached = trackAnalysisRef.current.get(trackKey), binding = analysisSourceRef.current.get(trackKey);
-    if (cached && binding?.url === sourceUrl && isTrackAnalysisSourceValid(cached, trackKey, binding.signature, mediaDuration || binding.duration)) return Promise.resolve(cached);
+    const matchesDurationHint = (duration: number) => !Number.isFinite(mediaDuration) || mediaDuration <= 0 || Math.abs(duration - mediaDuration) <= 1;
+    if (cached && binding?.url === sourceUrl && matchesDurationHint(cached.duration)
+      && isTrackAnalysisSourceValid(cached, trackKey, binding.signature, binding.duration || mediaDuration)) return Promise.resolve(cached);
     const pending = analysisPromiseRef.current.get(trackKey);
     if (pending && binding?.url === sourceUrl) return pending;
     const active = activeQQTrackLiveRef.current;
@@ -2511,7 +2589,11 @@ export function RadioExperience() {
         if (!isCurrent()) return null;
         const diskCached = await withTimeout(window.codioDesktop?.analysis?.get(trackKey, 3) || Promise.resolve(null), 1200, "ANALYSIS_CACHE").catch(() => null);
         if (!isCurrent()) return null;
-        if (diskCached && isTrackAnalysisSourceValid(diskCached, trackKey, sourceBinding.signature, mediaDuration || diskCached.duration)) {
+        // The exact byte digest identifies this file. QQ's integer catalogue
+        // duration is only a hint, not a replacement for its decoded duration.
+        // Deck adoption still checks the actual HTMLMediaElement duration.
+        if (diskCached && matchesDurationHint(diskCached.duration)
+          && isTrackAnalysisSourceValid(diskCached, trackKey, sourceBinding.signature, diskCached.duration)) {
           sourceBinding.duration = diskCached.duration;
           setBoundedCache(trackAnalysisRef.current, trackKey, diskCached, 48);
           supplementAnalyzedPreferences(trackKey, diskCached);
@@ -2521,10 +2603,10 @@ export function RadioExperience() {
         }
         const context = audioContextRef.current || new AudioContext();
         audioContextRef.current = context;
-        const buffer = await context.decodeAudioData(bytes.slice(0));
+        const buffer = await context.decodeAudioData(bytes);
         if (!isCurrent()) return null;
         const result = await analyzeDecodedBuffer(trackKey, buffer, sourceBinding.signature, controller.signal, generation);
-        if (!result || !isCurrent() || !isTrackAnalysisSourceValid(result, trackKey, sourceBinding.signature, mediaDuration || buffer.duration)) return null;
+        if (!result || !isCurrent() || !isTrackAnalysisSourceValid(result, trackKey, sourceBinding.signature, buffer.duration)) return null;
         sourceBinding.duration = buffer.duration;
         setBoundedCache(trackAnalysisRef.current, trackKey, result, 48);
         supplementAnalyzedPreferences(trackKey, result);
@@ -2560,7 +2642,7 @@ export function RadioExperience() {
     return validWave(analysis) ? analysis!.waveform! : null;
   }
 
-  function prepareTrack(track: QQTrack, eager = false) {
+  function prepareTrack(track: QQTrack, eager = false, minimumValidityMs = 0) {
     const now = Date.now();
     const authorizationRevision = qqAuthorizationRevisionRef.current;
     const cache = preparedTracksRef.current;
@@ -2574,7 +2656,7 @@ export function RadioExperience() {
       });
     }
     for (const [mid, entry] of cache) {
-      if (now >= (entry.expiresAt ?? entry.createdAt + PREPARED_TRACK_TTL_MS)
+      if (now + (mid === track.mid ? minimumValidityMs : 0) >= (entry.expiresAt ?? entry.createdAt + PREPARED_TRACK_TTL_MS)
         || (entry.expiresAt === undefined && entry.authorizationRevision !== undefined && entry.authorizationRevision !== authorizationRevision)) {
         cache.delete(mid);
         discardPreparedEntry(entry);
@@ -2773,11 +2855,17 @@ export function RadioExperience() {
     if (!queue.length || activeQQTrackLiveRef.current?.mid !== currentMid) return;
     const currentIndex = queue.findIndex((item) => item.mid === currentMid);
     if (currentIndex < 0) return;
+    const currentAudio = musicAudioRef.current;
+    // A deck adopted by a tail-only/neutral handoff must acquire its OWN
+    // timeline too. Only startQQTrack used to do this, breaking later mixes.
+    const currentAnalysisPromise = currentAudio
+      ? analyseTrackWhenBuffered(currentMid, currentAudio.dataset.codioSource || currentAudio.src, currentAudio)
+      : Promise.resolve(null);
     const next = queue[currentIndex + 1];
     if (next && next.mid !== currentMid) {
       const pairIsCurrent = () => activeQQTrackLiveRef.current?.mid === currentMid && playQueueRef.current[activeQueueIndexRef.current + 1]?.mid === next.mid;
       const pairKey = transitionPairKey(currentMid, next.mid);
-      const preparedPromise = prepareTrack(next, true);
+      const preparedPromise = prepareTrack(next, true, 45000);
       void preparedPromise.then(async (prepared) => {
         if (!prepared?.coverData || !pairIsCurrent()) return;
         const grid = window.innerWidth < 720 ? 180 : 192;
@@ -2788,23 +2876,23 @@ export function RadioExperience() {
           setBoundedCache(coverPointPairsRef.current, `${grid}:${outgoingSource}→${prepared.coverData}`, spatiallyPairCoverPoints(outgoingPoints, targetPoints), 3);
         }
       });
-      if (!transitionPlansRef.current.has(pairKey)) {
-        notifySystem("正在预读下一首", "analysis", `${next.title} · 播放连接、前奏与节拍`);
+      {
+        if (!transitionPlansRef.current.has(pairKey)) notifySystem("正在预读下一首", "analysis", `${next.title} · 播放连接、前奏与节拍`);
         void Promise.all([
-          musicAudioRef.current ? Promise.resolve(analysisForAudio(currentMid, musicAudioRef.current)) : Promise.resolve(null),
+          currentAnalysisPromise,
           preparedPromise.then((prepared) => prepared?.playback.url && pairIsCurrent() ? analyseTrackSource(next.mid, prepared.playback.url, prepared.audio?.duration || next.durationSeconds) : null),
         ]).then(([outgoingAnalysis, incomingAnalysis]) => {
           if (!outgoingAnalysis || !incomingAnalysis || activeQQTrackLiveRef.current?.mid !== currentMid || playQueueRef.current[activeQueueIndexRef.current + 1]?.mid !== next.mid) return;
           const plan = planTransition(outgoingAnalysis, incomingAnalysis, `transition-${++transitionSequenceRef.current}`);
           setBoundedCache(transitionPlansRef.current, pairKey, plan, 36);
           seamlessAttemptedRef.current = null;
-          if (activeQQTrack?.mid === currentMid) notifySystem(
+          if (pairIsCurrent()) notifySystem(
             "下一首衔接方案已准备",
             "ready",
             `${plan.strategy === "phrase-eq-blend" ? "BEAT BLEND" : plan.strategy === "downbeat-cut" ? "PHRASE CUT" : "AMBIENT BRIDGE"} · ${next.title}`,
           );
         }).catch(() => {
-          if (activeQQTrack?.mid === currentMid) notifySystem("下一首将使用安全衔接", "warning", "分析暂不可用，播放不会中断");
+          if (pairIsCurrent()) notifySystem("下一首将使用安全衔接", "warning", "分析暂不可用，播放不会中断");
         });
       }
     }
@@ -2813,7 +2901,10 @@ export function RadioExperience() {
       if (current) void extendRecommendationQueue(current).then((expanded) => {
         const upcoming = expanded[currentIndex + 1];
         if (upcoming && upcoming.mid !== currentMid && activeQQTrackLiveRef.current?.mid === currentMid
-          && playQueueRef.current[activeQueueIndexRef.current + 1]?.mid === upcoming.mid) void prepareTrack(upcoming, true);
+          && playQueueRef.current[activeQueueIndexRef.current + 1]?.mid === upcoming.mid) {
+          void prepareTrack(upcoming, true, 45000);
+          if (!next || upcoming.mid !== next.mid) prepareUpcomingTrack(currentMid);
+        }
       });
     }
   }
@@ -2855,6 +2946,18 @@ export function RadioExperience() {
     if (update.startupReady) return;
     update.startupReady = true;
     if (update.triggers.size) requestRecommendationUpdate("startup_ready");
+  }
+
+  function waitForRecommendationUpdate(revision: number) {
+    const update = recommendationUpdateRef.current;
+    if (Number(update.latest.revision) >= revision && !["queued", "running"].includes(String(update.latest.status))) return Promise.resolve();
+    // An event notification, not a polling loop. Slow retrieval remains queued
+    // after this bounded observation window, never reported as a completion.
+    return new Promise<void>(resolve => {
+      const done = () => { window.clearTimeout(timer); update.waiters.delete(done); resolve(); };
+      const timer = window.setTimeout(done, 2500);
+      update.waiters.add(done);
+    });
   }
 
   async function enrichTrackMetadata(track: QQTrack, deadline = Infinity): Promise<QQTrack> {
@@ -3041,6 +3144,8 @@ export function RadioExperience() {
     let lastUiTime = -1, lastUiDuration = -1, lastUiLyricIndex = -1;
     let plannedOutgoing: TrackAnalysis | null = null, plannedIncoming: TrackAnalysis | null = null;
     let plannedNext = "", cachedPlan: TransitionPlan | null = null;
+    let attemptNext = "", attempts = 0, retryAfter = 0;
+    let preparationNext = "", preparationRuns = 0, lastPreparationAt = -Infinity;
     const clearStallTimer = () => {
       if (stallTimer !== null) window.clearTimeout(stallTimer);
       stallTimer = null;
@@ -3084,21 +3189,42 @@ export function RadioExperience() {
         }
         const remaining = effectiveDuration - audio.currentTime;
         const upcoming = playQueueRef.current[activeQueueIndexRef.current + 1];
+        if (upcoming && !audio.paused && !userPausedRef.current && !seamlessTransitionRef.current) {
+          if (preparationNext !== upcoming.mid) { preparationNext = upcoming.mid; preparationRuns = 0; lastPreparationAt = -Infinity; }
+          const prepared = preparedTracksRef.current.get(upcoming.mid);
+          if (preparationRuns < 3 && Date.now() - lastPreparationAt >= 30000
+            && (!outgoingAnalysis || !trackAnalysisRef.current.has(upcoming.mid) || !prepared || Number(prepared.expiresAt) < Date.now() + 45000)) {
+            preparationRuns += 1; lastPreparationAt = Date.now();
+            prepareUpcomingTrack(trackKey);
+          }
+        }
         let plan: TransitionPlan | null = null;
-        if (upcoming && outgoingAnalysis) {
+        if (upcoming) {
           const incoming = trackAnalysisRef.current.get(upcoming.mid), source = analysisSourceRef.current.get(upcoming.mid);
           const trustedIncoming = incoming && source && isTrackAnalysisSourceValid(incoming, upcoming.mid, source.signature, source.duration) ? incoming : null;
           if (plannedOutgoing !== outgoingAnalysis || plannedIncoming !== trustedIncoming || plannedNext !== upcoming.mid) {
             plannedOutgoing = outgoingAnalysis; plannedIncoming = trustedIncoming; plannedNext = upcoming.mid;
-            cachedPlan = trustedIncoming ? planTransition(outgoingAnalysis, trustedIncoming, `planned-${trackKey}-${upcoming.mid}`)
-              : planSilenceHandoff(outgoingAnalysis, null, upcoming.mid, `tail-${trackKey}-${upcoming.mid}`);
+            cachedPlan = outgoingAnalysis && trustedIncoming ? planTransition(outgoingAnalysis, trustedIncoming, `planned-${trackKey}-${upcoming.mid}`)
+              : outgoingAnalysis ? planSilenceHandoff(outgoingAnalysis, trustedIncoming, upcoming.mid, `tail-${trackKey}-${upcoming.mid}`) : null;
+            if (!cachedPlan) {
+              const neutral = createNeutralTransitionPlan(trackKey, upcoming.mid, `safe-${trackKey}-${upcoming.mid}`, "automatic");
+              cachedPlan = { ...neutral, outgoingCue: Math.max(0, effectiveDuration - neutral.transitionDuration) };
+            }
           }
           plan = cachedPlan;
         }
+        if (attemptNext !== (upcoming?.mid || "")) { attemptNext = upcoming?.mid || ""; attempts = 0; retryAfter = 0; seamlessAttemptedRef.current = null; }
         const reachedPlannedCue = Boolean(plan && audio.currentTime >= plan.outgoingCue - .08);
-        if (seamlessRef.current && !userPausedRef.current && !audio.paused && remaining > 0.35 && reachedPlannedCue && activeQueueIndexRef.current >= 0 && activeQueueIndexRef.current < playQueueRef.current.length - 1 && !seamlessTransitionRef.current && seamlessAttemptedRef.current !== trackKey) {
+        if (seamlessRef.current && !userPausedRef.current && !audio.paused && remaining > 0.35 && reachedPlannedCue && activeQueueIndexRef.current >= 0 && activeQueueIndexRef.current < playQueueRef.current.length - 1 && !seamlessTransitionRef.current && seamlessAttemptedRef.current !== trackKey && attempts < 3 && Date.now() >= retryAfter) {
           seamlessAttemptedRef.current = trackKey;
-          void beginSeamlessCrossfade(trackKey);
+          attempts += 1;
+          const nextId = upcoming?.mid;
+          void Promise.resolve(beginSeamlessCrossfade(trackKey)).then(result => {
+            if (result !== "unavailable" || musicAudioRef.current !== audio || userPausedRef.current
+              || playQueueRef.current[activeQueueIndexRef.current + 1]?.mid !== nextId) return;
+            retryAfter = Date.now() + 600;
+            seamlessAttemptedRef.current = null;
+          });
         }
         if (remaining <= 0.16 && audio.currentTime > .8 && !audio.paused && !userPausedRef.current && !seamlessTransitionRef.current) advanceFromFinishedAudio(audio);
       }
@@ -3132,6 +3258,7 @@ export function RadioExperience() {
     };
     audio.onseeked = () => {
       if (musicAudioRef.current !== audio) return;
+      attempts = 0; retryAfter = 0; seamlessAttemptedRef.current = null;
       lastUiTime = -1;
       audio.dispatchEvent(new Event("timeupdate"));
     };
@@ -3450,11 +3577,19 @@ export function RadioExperience() {
     let incoming: HTMLAudioElement | null = null;
     let runtime: TransitionRuntime | null = null;
     let transitionId = requestedTransitionId;
+    const waitBudget = (limit: number) => reason === "automatic"
+      ? Math.max(150, Math.min(limit, ((analysisForAudio(outgoingTrackKey, outgoing)?.effectiveEnd || outgoing.duration) - outgoing.currentTime) * 1000 + 400))
+      : limit;
+    const record = (stage: string, facts: Record<string, unknown> = {}) => {
+      window.codioPlaybackDiagnostics = [...(window.codioPlaybackDiagnostics || []), { event: "transition", stage, reason,
+        outgoingId: outgoingTrackKey, incomingId: next.mid, outgoingTime: outgoing.currentTime, fileEnd: outgoing.duration,
+        incomingTime: incoming?.currentTime ?? null, audioTime: audioContextRef.current?.currentTime ?? null, ...facts }].slice(-24);
+    };
     notifySystem(reason === "automatic" ? "潜流正在准备交接" : "正在接住你的选择", "analysis", `${outgoingTrack.title} → ${next.title}`);
     try {
       if (reason === "automatic" && (userPausedRef.current || outgoing.paused || outgoing.ended)) throw new Error("TRANSITION_WINDOW_MISSED");
       await resumeMusicAudioGraph();
-      const prepared = await prepareTrack(next, true);
+      const prepared = await withTimeout(prepareTrack(next, true), waitBudget(reason === "automatic" ? 3500 : 12000), "TRANSITION_SOURCE");
       if (requestId !== transitionRequestRef.current) throw new Error("STALE_TRANSITION");
       if (!prepared?.playback.url || !prepared.audio) throw new Error("TRANSITION_SOURCE_UNAVAILABLE");
       if (reason === "automatic" && playQueueRef.current[nextIndex]?.mid !== next.mid) throw new Error("STALE_TRANSITION_PLAN");
@@ -3462,14 +3597,30 @@ export function RadioExperience() {
       pendingTransitionAudioRef.current = { requestId, audio: incoming };
       preparedTracksRef.current.delete(next.mid);
       const incomingLyricsPromise = window.codioDesktop?.qqMusic.lyrics(next).catch(() => [] as LyricLine[]) || Promise.resolve([] as LyricLine[]);
-      const outgoingAnalysis = analysisForAudio(outgoingTrackKey, outgoing);
+      let outgoingAnalysis = analysisForAudio(outgoingTrackKey, outgoing);
+      const outgoingSource = outgoing.dataset.codioSource || outgoing.src;
+      // The analysed source may already be ready while a renewed deck still
+      // has duration=NaN. Wait for metadata BEFORE deciding it is unanalysed.
+      let removeMetadataListeners = () => {};
+      if (incoming.readyState < 1) await withTimeout(new Promise<void>((resolve, reject) => {
+        const loaded = () => { cleanup(); resolve(); };
+        const failed = () => { cleanup(); reject(new Error("TRANSITION_METADATA_ERROR")); };
+        const cleanup = () => { incoming?.removeEventListener("loadedmetadata", loaded); incoming?.removeEventListener("error", failed); };
+        removeMetadataListeners = cleanup;
+        incoming?.addEventListener("loadedmetadata", loaded, { once: true });
+        incoming?.addEventListener("error", failed, { once: true });
+      }), waitBudget(3500), "TRANSITION_METADATA").finally(() => removeMetadataListeners());
+      if (requestId !== transitionRequestRef.current) throw new Error("STALE_TRANSITION");
+      if ((outgoing.dataset.codioSource || outgoing.src) !== outgoingSource) throw new Error("TRANSITION_SOURCE_CHANGED");
+      const latestOutgoing = analysisForAudio(outgoingTrackKey, outgoing);
+      if (outgoingAnalysis && latestOutgoing !== outgoingAnalysis) throw new Error("TRANSITION_SOURCE_CHANGED");
+      outgoingAnalysis = latestOutgoing;
       // Next analysis was already requested at track start. Do not start a late
       // full decode in the last second; a verified tail can bridge without BPM.
       const incomingAnalysis = analysisForAudio(next.mid, incoming);
       const boundaryPlan = outgoingAnalysis ? planSilenceHandoff(outgoingAnalysis, incomingAnalysis, next.mid, requestedTransitionId) : null;
-      if (reason === "automatic" && (!outgoingAnalysis || !incomingAnalysis) && !boundaryPlan) throw new Error("TRANSITION_ANALYSIS_UNAVAILABLE");
       const outgoingSnapshotAnalysis = outgoingAnalysis || unavailableTransitionAnalysis(outgoingTrackKey, outgoing.duration || outgoingTrack.durationSeconds);
-      const incomingSnapshotAnalysis = incomingAnalysis || unavailableTransitionAnalysis(next.mid, next.durationSeconds);
+      const incomingSnapshotAnalysis = incomingAnalysis || unavailableTransitionAnalysis(next.mid, incoming.duration || next.durationSeconds);
       const pairKey = transitionPairKey(outgoingTrackKey, next.mid);
       let plan = null as TransitionPlan | null;
       if (outgoingAnalysis && incomingAnalysis) {
@@ -3479,7 +3630,7 @@ export function RadioExperience() {
       plan = plan || boundaryPlan;
       plan = plan
         ? adaptTransitionPlan(plan, reason, !wasPlaying)
-        : createNeutralTransitionPlan(outgoingTrackKey, next.mid, requestedTransitionId, reason === "automatic" ? "manual-next" : reason, !wasPlaying);
+        : createNeutralTransitionPlan(outgoingTrackKey, next.mid, requestedTransitionId, reason, !wasPlaying);
       if (!isTransitionPlanUsable({ ...plan, confidence: Math.max(.18, plan.confidence) }, outgoingTrackKey, next.mid)) throw new Error("STALE_TRANSITION_PLAN");
       transitionId = `${plan.id}-${requestId}`;
       plan = { ...plan, id: transitionId };
@@ -3493,10 +3644,6 @@ export function RadioExperience() {
       incomingChain.gain.gain.value = 0;
       incoming.volume = 1;
       wireMusicAudio(incoming, next.mid);
-      if (incoming.readyState < 1) await withTimeout(new Promise<void>((resolve, reject) => {
-        incoming?.addEventListener("loadedmetadata", () => resolve(), { once: true });
-        incoming?.addEventListener("error", () => reject(new Error("TRANSITION_METADATA_ERROR")), { once: true });
-      }), 3500, "TRANSITION_METADATA");
       if (requestId !== transitionRequestRef.current) throw new Error("STALE_TRANSITION");
       const validatedOutgoing = analysisForAudio(outgoingTrackKey, outgoing);
       if (outgoingAnalysis && validatedOutgoing !== outgoingAnalysis) throw new Error("TRANSITION_SOURCE_CHANGED");
@@ -3507,18 +3654,24 @@ export function RadioExperience() {
       incoming.playbackRate = plan.incomingTempoRatio;
       outgoing.playbackRate = plan.outgoingTempoRatio;
       if (reason === "automatic" && (userPausedRef.current || outgoing.paused || outgoing.ended)) throw new Error("TRANSITION_WINDOW_MISSED");
+      if (reason === "automatic" && playQueueRef.current[nextIndex]?.mid !== next.mid) throw new Error("STALE_TRANSITION_PLAN");
       // The first intro samples must already be audible while play() settles.
       incomingChain.gain.gain.setValueAtTime(plan.incomingGainCurve[0], context.currentTime);
       incomingChain.lowEq.gain.setValueAtTime(-16 * (1 - plan.incomingLowCurve[0]), context.currentTime);
       incomingChain.midEq.gain.setValueAtTime(-9 * (1 - plan.incomingMidCurve[0]), context.currentTime);
       incomingChain.highEq.gain.setValueAtTime(-8 * (1 - plan.incomingHighCurve[0]), context.currentTime);
-      await withTimeout(incoming.play(), 8000, "TRANSITION_AUDIO_START");
+      await withTimeout(incoming.play(), waitBudget(8000), "TRANSITION_AUDIO_START");
       if (!wasPlaying) incoming.pause();
       if (requestId !== transitionRequestRef.current) throw new Error("STALE_TRANSITION");
+      record("incoming_started", { lastAudibleTime: outgoingAnalysis?.silence?.lastAudibleTime ?? null,
+        effectiveEnd: outgoingSnapshotAnalysis.effectiveEnd, boundaryHandoff: Boolean(plan.boundaryHandoff),
+        analysisMode: outgoingAnalysis && incomingAnalysis ? "pair" : plan.boundaryHandoff ? "tail_only" : "neutral",
+        initialGain: incomingChain.gain.gain.value, incomingCue: plan.incomingCue });
       const duration = reason === "automatic"
-        ? Math.min(plan.transitionDuration, Math.max(.1, outgoingSnapshotAnalysis.effectiveEnd - outgoing.currentTime - .04))
+        ? Math.min(plan.transitionDuration, Math.max(.12, outgoingSnapshotAnalysis.effectiveEnd - outgoing.currentTime - .04))
         : plan.transitionDuration;
-      if (duration < .25) throw new Error("TRANSITION_WINDOW_MISSED");
+      // Once an intro is audible, a late play() resolution must not discard it
+      // and start it again. Compress the remaining handoff, not the music.
       const startAt = context.currentTime + .02;
       runtime = {
         id: transitionId, state: "phase-locking", plan, outgoing, incoming,
@@ -3547,6 +3700,9 @@ export function RadioExperience() {
         scheduleDeckPlan(incomingChain, plan, "incoming", startAt, duration);
         if (plan.strategy === "phrase-eq-blend") lockTransitionBeats(runtime);
       }
+      record("scheduled", { strategy: plan.strategy, duration, startAt, effectiveEnd: outgoingSnapshotAnalysis.effectiveEnd,
+        plannedDuration: plan.transitionDuration, outgoingCue: plan.outgoingCue, incomingRate: plan.incomingTempoRatio, outgoingRate: plan.outgoingTempoRatio,
+        initialIncomingGain: plan.incomingGainCurve[0], initialIncomingLowEqDb: -16 * (1 - plan.incomingLowCurve[0]) });
       const commitIncoming = () => {
         if (!runtime || runtime.committed || activeTransitionRef.current?.id !== transitionId) return;
         runtime.committed = true;
@@ -3570,6 +3726,7 @@ export function RadioExperience() {
         setIsPlaying(wasPlaying);
         rememberPlayedTrack(next, prepared.coverData);
         beginListeningForTrack(next, recommendationSourceForTrack(next));
+        record("committed", { queueIndex, effectiveEnd: outgoingSnapshotAnalysis.effectiveEnd });
         seamlessAttemptedRef.current = null;
         armPlaybackBoundaryCheck();
       };
@@ -3588,14 +3745,23 @@ export function RadioExperience() {
       incomingChain.gain.gain.setTargetAtTime(wasPlaying ? 1 : 0, finishAt, .04);
       holdTransitionDuringSettling(runtime);
       const recoveryDuration = Math.max(9000, Math.min(24000, 32 * 60 / Math.max(70, incomingSnapshotAnalysis.bpm || 96) * 1000));
-      if (wasPlaying) window.setTimeout(() => relaxPlaybackRate(incoming!, plan!.incomingTempoRatio, transitionId, recoveryDuration), 1800);
+      if (wasPlaying && Math.abs(plan.incomingTempoRatio - 1) >= .002) window.setTimeout(() => relaxPlaybackRate(incoming!, plan!.incomingTempoRatio, transitionId, recoveryDuration), 1800);
       await waitForTransitionAudioEnd(context, finishAt + runtime.settlingDuration, transitionId);
       if (activeTransitionRef.current?.id === transitionId) runtime.state = "completed";
       stopTransitionCoordinator();
       prepareUpcomingTrack(next.mid);
-      notifySystem(`${next.title} · 已接稳`, "success", plan.boundaryHandoff ? "已按确认的有声尾端交接；下一首前奏从可闻增益进入" : reason === "automatic" ? "结构、节拍与视觉已完成交接" : "你的选择已成为当前播放");
+      notifySystem(`${next.title} · 已接稳`, "success", plan.boundaryHandoff ? "已按确认的有声尾端交接；下一首前奏从可闻增益进入"
+        : reason !== "automatic" ? "你的选择已成为当前播放"
+          : plan.strategy === "phrase-eq-blend" ? "双 Deck 节拍对齐与低频交换已完成" : "原速音频交叠已完成；没有强行锁拍");
       return "played" as const;
-    } catch {
+    } catch (error) {
+      record("failed", { error: error instanceof Error && /^[A-Z_]+$/.test(error.message) ? error.message : "TRANSITION_FAILED" });
+      if (requestId === transitionRequestRef.current && reason === "automatic" && !userPausedRef.current && error instanceof Error
+        && /^(?:TRANSITION_SOURCE(?:_UNAVAILABLE|_TIMEOUT)|TRANSITION_METADATA(?:_ERROR|_TIMEOUT)|TRANSITION_AUDIO_START_TIMEOUT)$/.test(error.message)) {
+        // Temporary source failures may be skipped by the existing bounded
+        // queue continuation; never hold a silent outgoing deck for 8–12s.
+        setBoundedCache(failedTracksRef.current, next.mid, Date.now(), 64);
+      }
       if (requestId !== transitionRequestRef.current) {
         if (incoming && incoming !== musicAudioRef.current && incoming !== activeTransitionRef.current?.incoming && incoming !== activeTransitionRef.current?.outgoing) releaseMusicAudio(incoming);
         return "unavailable" as const;
@@ -3642,7 +3808,7 @@ export function RadioExperience() {
     const nextIndex = activeQueueIndexRef.current + 1;
     const next = queue[nextIndex];
     if (!next) return;
-    await transitionToTrack(next, nextIndex, "automatic", outgoingTrackKey);
+    return transitionToTrack(next, nextIndex, "automatic", outgoingTrackKey);
   }
 
   function rememberPlayedTrack(track: QQTrack, resolvedCover?: string) {
@@ -3899,30 +4065,15 @@ export function RadioExperience() {
     const insertionIndex = insertionAnchor ? base.findIndex((item) => item.mid === insertionAnchor.mid) : -1;
     base.splice(Math.max(currentIndex, insertionIndex) + 1, 0, track);
     manualQueueIdsRef.current.add(track.mid);
+    if (!current) initialRecommendationRef.current = true;
     setPlayQueue(base);
     playQueueRef.current = base;
     setActiveQueueIndex(currentIndex);
     activeQueueIndexRef.current = currentIndex;
     setToast(`UP NEXT · ${track.title}`);
     seamlessAttemptedRef.current = null;
-    const audio = musicAudioRef.current;
-    if (!activeQQTrackLiveRef.current || !audio?.src || audio.paused || audio.ended) {
-      const selectedIndex = Math.max(0, base.findIndex((item) => item.mid === track.mid));
-      manualSelectionRef.current = track.mid;
-      setSearchOpen(false);
-      setSearchQuery("");
-      try {
-        const result = await startQQTrack(track, 1);
-        if (result === "played") {
-          setActiveQueueIndex(selectedIndex);
-          activeQueueIndexRef.current = selectedIndex;
-        }
-      } finally {
-        manualSelectionRef.current = null;
-      }
-      return;
-    }
-    prepareUpcomingTrack(activeQQTrackLiveRef.current.mid);
+    // NEXT edits the queue; it is never permission to start or switch playback.
+    if (current) prepareUpcomingTrack(current.mid);
   }
 
   async function nextTrack(fromEnded = false) {
@@ -4063,6 +4214,14 @@ export function RadioExperience() {
       if (transport.revision === revision) transport.pending = false;
       return;
     }
+    const queuedIndex = Math.max(0, activeQueueIndexRef.current);
+    const queued = playQueueRef.current[queuedIndex];
+    if (queued) {
+      const result = await startQQTrack(queued);
+      if (result === "played") { setActiveQueueIndex(queuedIndex); activeQueueIndexRef.current = queuedIndex; }
+      if (transport.revision === revision) transport.pending = false;
+      return;
+    }
     try {
       const results = await desktop.search(`${currentTrack.title} ${currentTrack.artist}`);
       if (transport.revision !== revision || userPausedRef.current) return;
@@ -4160,13 +4319,14 @@ export function RadioExperience() {
         seamless: seamlessRef.current,
       },
       recommendations: {
-        closeMatch: matchedExperiments.map(({ title, artist, reason }) => ({ title, artist, reason })),
-        frontier: visibleExperiments.map(({ title, artist, reason }) => ({ title, artist, reason })),
+        closeMatch: recommendationVisibleRef.current.matched.map(({ title, artist, reason }) => ({ title, artist, reason })),
+        frontier: recommendationVisibleRef.current.frontier.map(({ title, artist, reason }) => ({ title, artist, reason })),
         currentRecommendationScore: activeScore ? { candidateKey: activeScore.candidateKey, totalScore: activeScore.totalScore,
           contributions: activeScore.contributions.filter(item => item.signedWeight !== 0).slice(0, 12) } : null,
         currentRecommendationReasons: activeScore?.topReasons || [],
         latestUpdate: { status: latest.status, revision: latest.revision, profileVersion: latest.profileVersion,
           hiddenQueueCommitted: latest.hiddenQueueCommitted, visibleBatchPreserved: latest.visibleBatchPreserved,
+          hiddenPoolCommitted: latest.hiddenPoolCommitted, hiddenPoolChanged: latest.hiddenPoolChanged, hiddenCandidateCount: latest.hiddenCandidateCount,
           lanes: Array.isArray(latest.lanes) ? latest.lanes.map((lane: Record<string, unknown>) => ({ lane: lane.lane,
             status: lane.status, hiddenQueueCommitted: lane.hiddenQueueCommitted, error: lane.error })) : [] },
       },
@@ -4196,11 +4356,13 @@ export function RadioExperience() {
     };
   };
 
-  const executeCodioTool = async (call: CodioToolCall, searchWhitelist: Map<string, QQTrack>, userText: string) => {
+  const executeCodioTool = async (call: CodioToolCall, searchWhitelist: Map<string, QQTrack>, userText: string,
+    liveQQ?: { loggedIn: boolean; playbackReady: boolean; statusVerified?: boolean }) => {
     const args = call.arguments;
+    const connected = liveQQ?.loggedIn ?? qqConnection === "connected";
     const policyError = validateCodioToolCall(call, {
-      qqConnected: qqConnection === "connected",
-      playbackReady: qqPlaybackReady,
+      qqConnected: connected,
+      playbackReady: liveQQ?.playbackReady ?? qqPlaybackReady,
       searchResultIds: [...searchWhitelist.keys()],
       searchResultArtists: [...new Set([...searchWhitelist.values()].map((track) => track.artist))],
       searchResultTracks: [...searchWhitelist.values()].map((track) => ({ id: track.mid, title: track.title, artist: track.artist })),
@@ -4213,7 +4375,7 @@ export function RadioExperience() {
         panel: profileOpen ? "profile" : settingsOpen ? "settings" : nowPlayingOpen ? "now_playing" : djOpen ? "dj" : "close",
       },
     });
-    if (policyError) return { ok: false, error: policyError };
+    if (policyError) return { ok: false, error: policyError === "QQ_NOT_CONNECTED" && liveQQ?.statusVerified === false ? "QQ_STATUS_UNAVAILABLE" : policyError };
     if (call.name === "control_playback") {
       const action = String(args.action || "");
       const before = { playing: Boolean(musicAudioRef.current?.src && !musicAudioRef.current.paused), track: activeQQTrackLiveRef.current?.mid || null };
@@ -4228,7 +4390,7 @@ export function RadioExperience() {
       const ok = action === "pause" ? !after.playing : action === "play" ? after.playing : after.playing && after.track !== before.track;
       const status = ok ? action === "pause" ? "paused" : "played" : startingTrackRef.current ? "preparing"
         : request !== playbackRequestRef.current ? "superseded" : current && !after.playing ? "selected_not_playing" : "no_source";
-      return { ok, status, before, after, ...(ok ? {} : { error: current?.provider !== "local" && qqConnection !== "connected" ? "QQ_NOT_CONNECTED" : "PLAYBACK_NOT_CONFIRMED" }) };
+      return { ok, status, before, after, ...(ok ? {} : { error: current?.provider !== "local" && !connected ? "QQ_NOT_CONNECTED" : "PLAYBACK_NOT_CONFIRMED" }) };
     }
     if (call.name === "seek_playback") {
       const position = Number(args.position_percent);
@@ -4250,7 +4412,7 @@ export function RadioExperience() {
       const query = String(args.query || "").trim(); const limit = args.limit === undefined ? 8 : Number(args.limit);
       if (!query || query.length > 120) return { ok: false, error: "INVALID_SEARCH_QUERY" };
       if (!Number.isInteger(limit) || limit < 1 || limit > 10) return { ok: false, error: "INVALID_SEARCH_LIMIT" };
-      if (qqConnection !== "connected") return { ok: false, error: "QQ_NOT_CONNECTED" };
+      if (!connected) return { ok: false, error: "QQ_NOT_CONNECTED" };
       if (!window.codioDesktop?.qqMusic) return { ok: false, error: "SEARCH_UNAVAILABLE" };
       const results = (await window.codioDesktop.qqMusic.search(query, 1)).slice(0, limit);
       results.forEach((track) => searchWhitelist.set(track.mid, track));
@@ -4394,17 +4556,44 @@ export function RadioExperience() {
     const ai = window.codioDesktop?.ai;
     if (!ai) throw new Error("CODIO_MODEL_NOT_READY");
     const searchWhitelist = new Map<string, QQTrack>();
+    const permission = preferencePermissionForTurn(userText, pendingDjPreferenceRef.current);
+    pendingDjPreferenceRef.current = permission.pending;
+    let liveQQ = { loggedIn: qqConnection === "connected", playbackReady: qqPlaybackReady, statusVerified: false };
+    let observedRecommendationRevision = -1;
     const result = await runCodioAgentLoop({
       messages: history,
       context: buildCodioContext,
-      step: (messages, context) => {
+      step: async (messages) => {
+        if (messages.at(-1)?.role === "tool") {
+          const revisions = messages.filter(message => message.role === "tool").flatMap(message => {
+            try {
+              const result = JSON.parse(message.content);
+              return result.ok === true && result.persisted === true && typeof result.recommendationUpdate?.revision === "number"
+                ? [result.recommendationUpdate.revision as number] : [];
+            } catch { return []; }
+          });
+          const revision = Math.max(-1, ...revisions);
+          if (revision > observedRecommendationRevision) {
+            observedRecommendationRevision = revision;
+            await waitForRecommendationUpdate(revision);
+          }
+        }
+        // Read local capability, not a recovery flow or a stale React closure.
+        const status = await withTimeout(window.codioDesktop?.qqMusic?.getStatus({ recover: false }) || Promise.resolve(null), 3000, "AI_QQ_STATUS").catch(() => null);
+        liveQQ = status ? { loggedIn: status.loggedIn, playbackReady: status.playbackReady, statusVerified: true } : { ...liveQQ, statusVerified: false };
+        const context = buildCodioContext();
+        const library = { ...context.library, connected: liveQQ.loggedIn, playbackReady: liveQQ.playbackReady, statusVerified: Boolean(status) };
         setThinkingCue("等待 DeepSeek 根据真实状态与工具结果回复");
-        return withTimeout(ai.step({ messages, context }), 60000, "CODIO_MODEL");
+        return withTimeout(ai.step({ messages, context: { ...context, library,
+          ...(permission.text !== userText ? { resumedPreferenceRequest: permission.text } : {}) } }), 60000, "CODIO_MODEL");
       },
-      execute: (call) => executeCodioTool(call, searchWhitelist, userText),
+      execute: (call) => executeCodioTool(call, searchWhitelist, permission.text, liveQQ),
       maxRounds: 4,
       maxActions: 6,
     });
+    if (result.messages.some(message => message.role === "tool" && (() => {
+      try { const facts = JSON.parse(message.content); return facts.ok === true && facts.persisted === true; } catch { return false; }
+    })())) pendingDjPreferenceRef.current = null;
     return result.content;
   };
 
@@ -4570,7 +4759,7 @@ export function RadioExperience() {
   };
 
   const handleParallax = (event: React.PointerEvent<HTMLDivElement>) => {
-    if (!rootRef.current) return;
+    if (nowPlayingOpen || !rootRef.current) return;
     rootRef.current.style.setProperty("--cursor-x", `${event.clientX}px`);
     rootRef.current.style.setProperty("--cursor-y", `${event.clientY}px`);
     if (reducedMotion) return;
@@ -4643,8 +4832,6 @@ export function RadioExperience() {
       pointer.startX = event.clientX;
       pointer.startY = event.clientY;
     }
-    nowStageRef.current?.style.setProperty("--np-x", `${pointer.x * 18}px`);
-    nowStageRef.current?.style.setProperty("--np-y", `${pointer.y * 14}px`);
   };
 
   const startNowDrag = (event: React.PointerEvent<HTMLDivElement>) => {
@@ -4779,10 +4966,11 @@ export function RadioExperience() {
     let startupSnapshot: unknown = null;
     if (!pools[lane].revision) {
       try {
-        const saved = JSON.parse(window.localStorage.getItem(historyKey) || "{}") as { cursor?: number; exposure?: string[]; snapshot?: unknown };
+        const saved = JSON.parse(window.localStorage.getItem(historyKey) || "{}") as { cursor?: number; exposure?: string[]; snapshot?: unknown; acquiredPreferenceIds?: string[] };
         if (trigger !== "manual") startupSnapshot = saved.snapshot;
         pools[lane] = { ...pools[lane], cursor: Number.isInteger(saved.cursor) && saved.cursor! >= 0 ? Math.min(1000000, saved.cursor!) : 0,
-          exposure: Array.isArray(saved.exposure) ? saved.exposure.filter(key => typeof key === "string").slice(-1200) : [] };
+          exposure: Array.isArray(saved.exposure) ? saved.exposure.filter(key => typeof key === "string").slice(-1200) : [],
+          acquiredPreferenceIds: Array.isArray(saved.acquiredPreferenceIds) ? saved.acquiredPreferenceIds.filter(id => typeof id === "string" && id.length <= 160).slice(-1200) : [] };
       } catch { /* Corrupt non-sensitive cursor data does not clear listening memory. */ }
     }
     if (trigger === "manual") {
@@ -4826,7 +5014,7 @@ export function RadioExperience() {
     if (!desktop) return fail("QQ_UNAVAILABLE");
     try {
       reportBootTask("Checking music availability…");
-      const status = desktop.getStatus ? await withTimeout(desktop.getStatus(), 4000, "QQ_STATUS") : null;
+      const status = desktop.getStatus ? await withTimeout(desktop.getStatus(), 16000, "QQ_STATUS") : null;
       if (!valid()) return stale();
       if (status && (!status.loggedIn || !status.playbackReady)) return fail("QQ_NOT_CONNECTED");
       const owner = status?.userId || "";
@@ -4850,9 +5038,12 @@ export function RadioExperience() {
       const librarySeeds: QQTrack[] = [];
       for (let round = 0; round < 2; round++) for (const group of groupedLibrary.slice(0, 12)) if (group[round]) librarySeeds.push(group[round]);
       const exposed = new Set(pools[lane].exposure);
-      const scoringOptions = () => {
+      let scoringEvidence: ReturnType<typeof prepareScoringEvidence> | undefined;
+      const scoringOptions = (now = Date.now()) => {
         const active = activeQQTrackLiveRef.current, hour = new Date().getHours();
-        return { current: active ? featureVectorForTrack(active) : undefined, libraryFeatures,
+        if (!scoringEvidence || scoringEvidence.librarySource !== libraryFeatures || now < scoringEvidence.preparedAt || now >= scoringEvidence.expiresAt)
+          scoringEvidence = prepareScoringEvidence(profile, memory, now, libraryFeatures);
+        return { current: active ? featureVectorForTrack(active) : undefined, libraryFeatures, evidence: scoringEvidence,
           tasteCalibrated: profile.meaningfulSignalCount > 0 || library.length > 0,
           timeBucket: hour < 7 ? "late-night" : hour < 12 ? "morning" : hour < 18 ? "day" : "evening",
           weather: weatherSnapshotRef.current.text || weatherContext };
@@ -4879,7 +5070,15 @@ export function RadioExperience() {
       const reserveScores = new Map(retained.map(candidate => [candidate.canonicalKey, scoreCandidate(candidate, profile, memory, lane, Date.now(), reserveOptions)]));
       const reserve = trigger === "manual" ? commitRecommendationPoolUpdate(pools[lane], request,
         { candidates: retained, scores: reserveScores, otherOwnedKeys: otherOwnedKeys(), replaceVisible: true, profileVersion, flow: profile.sessionIntent?.flow }) : null;
-      const useRetainedPool = Boolean(reserve?.visibleCommitted && reserve.pool.visible.length === 12);
+      // Feedback first re-ranks the owned, previously source-checked reserve.
+      // It must not depend on a fresh provider search succeeding every time.
+      const needsPreferenceAcquisition = activePreferences(memory).some(event => event.value === "more"
+        && !(pools[lane].acquiredPreferenceIds || []).includes(event.eventId) && (
+        event.targetType === "artist" && !retained.some(candidate => recommendationArtistMatches(candidate.track.artist, event.artist || event.targetKey))
+        || event.targetType === "track" && !retained.some(candidate => candidate.canonicalKey === event.targetKey)));
+      const rerankOwnedPool = trigger === "feedback" && !needsPreferenceAcquisition && beforeVisible.length === 12 && retained.some(candidate =>
+        !exposed.has(candidate.canonicalKey) && reserveScores.get(candidate.canonicalKey)?.laneEvidence?.[lane]);
+      const useRetainedPool = rerankOwnedPool || Boolean(reserve?.visibleCommitted && reserve.pool.visible.length === 12);
       reportBootTask("Reading your music preferences…");
       // Restoring an owned batch performs no new acquisition. Do not put twelve
       // unrelated library metadata requests in front of its real source checks.
@@ -4896,7 +5095,8 @@ export function RadioExperience() {
       // Each retrieval processes eight seeds. Advancing only one seed repeated
       // seven old searches and could leave boot one card short indefinitely.
       const acquisitionCursor = request.cursor * 8;
-      const seeds = recommendationAcquisitionSeeds(lane, memory, profile, { libraryFeatures, cursor: acquisitionCursor, limit: 8 });
+      let scannedCursor = request.cursor;
+      let seeds = recommendationAcquisitionSeeds(lane, memory, profile, { libraryFeatures, cursor: acquisitionCursor, limit: 8 });
       if (!pools[lane].exposure.length) {
         let legacy: string[] = [];
         try {
@@ -4907,30 +5107,39 @@ export function RadioExperience() {
       }
       const acquisition: Array<{ seed: typeof seeds[number]; tracks: QQTrack[]; error: string | null; searchedPages: number[] }> = [];
       let seedCursor = 0;
+      let acquisitionPasses = 0;
+      const searched = new Set<string>();
       reportBootTask(useStartupSnapshot
         ? lane === "match" ? "Restoring close matches…" : "Restoring taste frontier…"
         : lane === "match" ? "Finding close matches…" : "Finding taste frontier tracks…");
-      const acquire = () => Promise.all(Array.from({ length: 2 }, async () => {
-        while (seedCursor < seeds.length && valid()) {
+      const acquire = () => {
+        acquisitionPasses += 1;
+        return Promise.all(Array.from({ length: 2 }, async () => {
+        while (seedCursor < seeds.length && valid() && Date.now() < startedAt + 45000) {
           const seed = seeds[seedCursor++];
+          const pageKey = `${seed.key}:${seed.page}`;
+          if (searched.has(pageKey)) continue;
+          searched.add(pageKey);
           const searchedPages = [seed.page];
           try {
             const accept = (tracks: QQTrack[]) => tracks.filter(track => track.mid && track.title && track.artist
               && (!seed.filterArtists.length || seed.filterArtists.some(artist => recommendationArtistMatches(track.artist, artist)))
               && !seed.excludeArtists.some(artist => recommendationArtistMatches(track.artist, artist)));
-            let tracks = accept(await withTimeout(desktop.search(seed.query, seed.page), 7000, "LANE_SEARCH"));
+            let tracks = accept(await withTimeout(desktop.search(seed.query, seed.page), Math.min(7000, startedAt + 45000 - Date.now()), "LANE_SEARCH"));
             // A refresh cursor is not the size of an artist's catalogue. A
             // missing high page must not strand startup with a partial lane.
             // Recover the same verified query once; ownership, exposure and
             // song-level qualification still decide whether results may enter.
-            if (!tracks.length && seed.page > 1 && valid()) {
+            if (!tracks.length && seed.page > 1 && valid() && Date.now() < startedAt + 45000 && !searched.has(`${seed.key}:1`)) {
+              searched.add(`${seed.key}:1`);
               searchedPages.push(1);
-              tracks = accept(await withTimeout(desktop.search(seed.query, 1), 7000, "LANE_SEARCH_FIRST_PAGE"));
+              tracks = accept(await withTimeout(desktop.search(seed.query, 1), Math.min(7000, startedAt + 45000 - Date.now()), "LANE_SEARCH_FIRST_PAGE"));
             }
             acquisition.push({ seed, tracks, searchedPages, error: null });
           } catch { acquisition.push({ seed, tracks: [], searchedPages, error: "SEARCH_UNAVAILABLE" }); }
         }
       }));
+      };
       if (!useStartupSnapshot && !useRetainedPool) await acquire();
       if (!valid()) return stale();
       timings.acquisitionMs = Date.now() - acquisitionStartedAt;
@@ -4968,8 +5177,10 @@ export function RadioExperience() {
         // Fair coverage of actual seed results, not the last 120 network replies.
         // Retained candidates and a few library anchors remain separate sources.
         const otherOwned = otherOwnedKeys();
+        const order = new Map(seeds.map((seed, index) => [seed.key, index]));
         return interleaveRecommendationSources([
-          ...seeds.map(seed => fromTracks(acquisition.find(batch => batch.seed.key === seed.key)?.tracks || [])),
+          ...[...acquisition].sort((a, b) => (order.get(a.seed.key) ?? seeds.length) - (order.get(b.seed.key) ?? seeds.length)
+            || a.seed.key.localeCompare(b.seed.key) || (a.seed.page || 1) - (b.seed.page || 1)).map(batch => fromTracks(batch.tracks)),
           ...(lane === "match" ? [fromTracks(seedLibrary)] : []), fromTracks([...retainedTracks.values()]),
         ].map(source => source.filter(entry => !exposed.has(recommendationIdentity(entry.track))
           && !otherOwned.has(recommendationIdentity(entry.track)) && !checkedKeys.has(recommendationIdentity(entry.track)))),
@@ -4984,7 +5195,7 @@ export function RadioExperience() {
       let cursor = 0;
       const qualificationScores = new Map<string, RecommendationScore>();
       const scoredResolved = (keepReserve = false) => {
-        const source = new Map(keepReserve && useRetainedPool ? retained.map(candidate => [candidate.canonicalKey, candidate]) : []);
+        const source = new Map((keepReserve || rerankOwnedPool) ? retained.map(candidate => [candidate.canonicalKey, candidate]) : []);
         // A partially displayed page remains part of composition, even when
         // its cards predate the current pool or no longer qualify for re-entry.
         for (const item of ownShown()) {
@@ -4998,7 +5209,7 @@ export function RadioExperience() {
         // A failed check cannot survive as an old playable hidden candidate.
         const candidates = [...source.values()].filter(candidate => !checkedKeys.has(candidate.canonicalKey)
           || resolved.some(entry => recommendationIdentity(entry.track) === candidate.canonicalKey));
-        const now = Date.now(), options = scoringOptions();
+        const now = Date.now(), options = scoringOptions(now);
         const scores = new Map([...qualificationScores, ...candidates.map(candidate => [candidate.canonicalKey, scoreCandidate(candidate, profile, memory, lane, now, options)] as const)]);
         return { candidates, scores };
       };
@@ -5045,7 +5256,8 @@ export function RadioExperience() {
               if (!known.genres?.length) known = await withTimeout(enrichTrackMetadata(track, deadline), remaining, "STARTUP_METADATA");
               const candidate = candidateForExperiment(entry.item, exposed, known);
               if (!candidate) continue;
-              const qualification = scoreCandidate(candidate, profile, memory, lane, Date.now(), scoringOptions());
+              const qualificationNow = Date.now();
+              const qualification = scoreCandidate(candidate, profile, memory, lane, qualificationNow, scoringOptions(qualificationNow));
               qualificationScores.set(candidate.canonicalKey, qualification);
               if (!qualification.laneEvidence?.[lane]) continue;
               remaining = deadline - Date.now();
@@ -5070,11 +5282,11 @@ export function RadioExperience() {
       }));
       // Finish the original page as a group before trying backups. A fast
       // worker must not launch a cold scan while the last original source waits.
-      await validateCandidates(useStartupSnapshot);
+      if (!rerankOwnedPool) await validateCandidates(useStartupSnapshot);
       if (useStartupSnapshot && valid() && !startupPageReady()) {
         await validateCandidates(false);
       }
-      if (useRetainedPool && valid() && !manualPageReady()) {
+      if (useRetainedPool && !rerankOwnedPool && valid() && !manualPageReady()) {
         // Expired/failed reserve sources fall back to this lane's retrieval,
         // not a false success, an old repeated batch or the other lane's pool.
         const fallbackStartedAt = Date.now();
@@ -5084,7 +5296,33 @@ export function RadioExperience() {
         if (!valid()) return stale();
         addAcquired();
         pending = acquiredEntries();
-        cursor = 0; deadline = Date.now() + 24000;
+        cursor = 0; deadline = validationStartedAt + validationExcludedMs + 24000;
+        await validateCandidates(false);
+      }
+      // Exhausting one page is not exhausting the provider catalogue. Continue
+      // THIS lane's seeds/pages, without clearing exposure or recycling a batch.
+      // Three passes bound network work; a genuine shortage preserves the page.
+      const pageReady = () => {
+        if (trigger === "manual") return manualPageReady();
+        if (useStartupSnapshot) return startupPageReady();
+        const { candidates, scores } = scoredResolved();
+        return commitRecommendationPoolUpdate(pools[lane], request, { candidates, scores, otherOwnedKeys: otherOwnedKeys(),
+          replaceVisible: false, profileVersion, flow: profile.sessionIntent?.flow }).pool.visible.length === 12;
+      };
+      while (!rerankOwnedPool && valid() && !pageReady() && acquisitionPasses < 3
+        && acquisition.some(batch => !batch.error) && Date.now() - startedAt < 45000
+        && Date.now() < validationStartedAt + validationExcludedMs + 24000) {
+        scannedCursor += 1;
+        seeds = recommendationAcquisitionSeeds(lane, memory, profile, { libraryFeatures, cursor: scannedCursor * 8, limit: 8 });
+        if (!seeds.some(seed => !searched.has(`${seed.key}:${seed.page}`))) break;
+        seedCursor = 0;
+        const refillStartedAt = Date.now();
+        await acquire();
+        const refillMs = Date.now() - refillStartedAt;
+        timings.acquisitionMs += refillMs; validationExcludedMs += refillMs;
+        if (!valid()) return stale();
+        addAcquired(); pending = acquiredEntries(); cursor = 0;
+        deadline = Math.min(validationStartedAt + validationExcludedMs + 24000, startedAt + 45000);
         await validateCandidates(false);
       }
       if (!valid()) return stale();
@@ -5092,7 +5330,7 @@ export function RadioExperience() {
       if (seeds.length && acquisition.length > 0 && acquisition.every(batch => batch.error) && !resolved.length) return fail("LANE_ACQUISITION_FAILED");
       const available = { ...recommendationTracksRef.current, ...(useRetainedPool ? Object.fromEntries(retainedTracks) : {}) };
       resolved.forEach(entry => { available[recommendationIdentity(entry.track)] = entry.track; });
-      recommendationTracksRef.current = available; setRecommendationTracks(available);
+      recommendationTracksRef.current = available;
       const { candidates, scores } = scoredResolved(true);
       reportBootTask("Applying your latest preferences…");
       const active = activeQQTrackLiveRef.current;
@@ -5108,7 +5346,9 @@ export function RadioExperience() {
         replaceVisible: trigger === "manual", profileVersion: listeningMemoryRef.current.updatedAt, flow: profile.sessionIntent?.flow,
         displayReadyKeys: new Set(resolved.map(entry => recommendationIdentity(entry.track))) });
       if (!valid() || committed.stale) return stale();
-      pools[lane] = committed.pool;
+      pools[lane] = { ...committed.pool, cursor: scannedCursor,
+        acquiredPreferenceIds: acquisition.some(batch => !batch.error)
+          ? activePreferences(memory).map(event => event.eventId) : (pools[lane].acquiredPreferenceIds || []) };
       const byId = new Map([...entries.values(), ...resolved].map(entry => [recommendationIdentity(entry.track), entry]));
       const oldItems = new Map(ownShown().map(item => [recommendationIdentity(item), item]));
       const asExperiment = (key: string) => {
@@ -5122,10 +5362,14 @@ export function RadioExperience() {
         if (lane === "match") setMatchedExperiments(shown); else setVisibleExperiments(shown);
         if (bootPhase === "playing") setBootPreparedSources(previous => new Set([...previous, ...shown.map(recommendationIdentity)]));
       }
-      scores.forEach((score, key) => { if (!otherOwned.has(key)) recommendationScoresRef.current.set(key, score); });
+      scores.forEach((score, key) => { if (!otherOwned.has(key)) {
+        recommendationScoresRef.current.delete(key);
+        recommendationScoresRef.current.set(key, score);
+      } });
       const ownCatalog = [...pools[lane].visible, ...pools[lane].hidden].map(asExperiment).filter((item): item is Experiment => Boolean(item));
       recommendationCatalogRef.current = [...recommendationCatalogRef.current.filter(item => item.lane === otherLane), ...ownCatalog];
       window.localStorage.setItem(historyKey, JSON.stringify({ cursor: pools[lane].cursor, exposure: pools[lane].exposure,
+        acquiredPreferenceIds: pools[lane].acquiredPreferenceIds,
         snapshot: buildStartupRecommendationSnapshot([...pools[lane].visible, ...pools[lane].hidden]
           .map(key => available[key]).filter((track): track is QQTrack => Boolean(track)).concat(useStartupSnapshot ? restored.tracks : []),
           pools[lane].visible, lane, owner) }));
@@ -5136,18 +5380,39 @@ export function RadioExperience() {
         || (seamlessTransitionRef.current ? playQueueRef.current[activeQueueIndexRef.current + 1]?.mid : null);
       if (promised) protectedIds.add(promised);
       const activeLane = active && recommendationSourceForTrack(active) === "recommendation_frontier" ? "frontier" : "match";
+      const hiddenPoolChanged = pools[lane].hidden.join("|") !== begun.pool.hidden.join("|");
       let hiddenQueueCommitted = false, hiddenQueueChanged = false;
       if (active && activeLane === lane && playQueueRef.current.length) {
         const adaptive = pools[lane].hidden.map(key => available[key]).filter((track): track is QQTrack => Boolean(track));
         const merged = mergeHiddenRecommendations(playQueueRef.current, adaptive, active.mid, protectedIds, false);
-        if (merged.currentIndex >= 0) {
+        // An empty re-rank is not permission to erase a working future queue.
+        if (merged.currentIndex >= 0 && adaptive.length > 0) {
           hiddenQueueChanged = merged.queue.map(track => track.mid).join("|") !== playQueueRef.current.map(track => track.mid).join("|");
           playQueueRef.current = merged.queue; setPlayQueue(merged.queue); activeQueueIndexRef.current = merged.currentIndex; setActiveQueueIndex(merged.currentIndex);
           prepareUpcomingTrack(active.mid); hiddenQueueCommitted = true;
         }
       }
+      // Bound disposable lookups, not user data. Retain both pools, the whole
+      // committed queue/manual prefix, transition and recent score explanations.
+      const runtime = activeTransitionRef.current;
+      const workingKeys = new Set([
+        ...Object.values(pools).flatMap(pool => [...pool.candidates.map(item => item.canonicalKey), ...pool.visible, ...pool.hidden]),
+        ...recommendationCatalogRef.current.map(recommendationIdentity),
+        ...discoveryPoolRef.current.map(recommendationIdentity),
+        ...Object.keys(discoveryTracksRef.current).slice(-260),
+        ...playQueueRef.current.map(recommendationIdentity),
+        ...[...recommendationScoresRef.current.keys()].slice(-1200),
+        ...(active ? [recommendationIdentity(active)] : []),
+        ...[runtime?.outgoingSnapshot.track, runtime?.incomingSnapshot.track].filter((track): track is QQTrack => Boolean(track)).map(recommendationIdentity),
+      ]);
+      for (const key of Object.keys(available)) if (!workingKeys.has(key)) delete available[key];
+      for (const key of recommendationScoresRef.current.keys()) if (!workingKeys.has(key)) recommendationScoresRef.current.delete(key);
+      for (const key of Object.keys(discoveryTracksRef.current)) if (!workingKeys.has(key)) delete discoveryTracksRef.current[key];
+      setRecommendationTracks(available);
       const visibleAfter = ownShown().map(recommendationIdentity);
-      const result = finish(pools[lane].status, { acquisitionCursor, startupSnapshotUsed: useStartupSnapshot, retainedPoolUsed: useRetainedPool,
+      const result = finish(pools[lane].status, { acquisitionCursor, acquisitionPasses, scannedCursor, rerankOwnedPool,
+        hiddenPoolCommitted: pools[lane].hidden.length > 0, hiddenPoolChanged, hiddenCandidateCount: pools[lane].hidden.length,
+        startupSnapshotUsed: useStartupSnapshot, retainedPoolUsed: useRetainedPool,
         restoredVisibleCount: useStartupSnapshot ? qualifiedStartupVisible(scores, otherOwned).length : 0,
         startupRejected: useStartupSnapshot ? restored.visible.filter(key => !qualifiedStartupVisible(scores, otherOwned).includes(key)).map(id => ({
           id, reason: scores.get(id)?.laneEvidence?.[lane] === false ? "LATEST_EVIDENCE_REJECTED"
@@ -5165,6 +5430,7 @@ export function RadioExperience() {
         visibleBefore: beforeVisible, visibleAfter, hiddenIds: pools[lane].hidden, visibleCount: shown.length,
         visibleCommitted: committed.visibleCommitted, visibleBatchPreserved: beforeVisible.every((id, index) => visibleAfter[index] === id),
         hiddenQueueCommitted, hiddenQueueChanged, queueCount: playQueueRef.current.length,
+        workingTrackCacheCount: Object.keys(available).length, workingScoreCacheCount: recommendationScoresRef.current.size,
         fullyBufferedSourceCount: bufferedSourcesRef.current.size, mediaElementCount: audioElementsRef.current.size,
         error: pools[lane].error });
       if (trigger === "manual") setToast(committed.visibleCommitted ? "Recommendations refreshed" : "本栏新的可靠候选不足，保留当前歌曲；另一栏不变");
@@ -5183,10 +5449,14 @@ export function RadioExperience() {
     const results = await Promise.all(lanes.map(selected => refreshRecommendationLane(selected, trigger, revision, triggers)));
     const result = { status: results.some(item => item.status === "completed") ? "completed"
       : results.every(item => item.status === "superseded") ? "superseded" : "insufficient_candidates",
-      lanes: results, revision, hiddenQueueCommitted: results.some(item => item.hiddenQueueCommitted),
+      lanes: results, revision, profileVersion: listeningMemoryRef.current.updatedAt,
+      hiddenPoolCommitted: results.some(item => item.hiddenPoolCommitted), hiddenPoolChanged: results.some(item => item.hiddenPoolChanged),
+      hiddenCandidateCount: results.reduce((sum, item) => sum + Number(item.hiddenCandidateCount || 0), 0),
+      hiddenQueueCommitted: results.some(item => item.hiddenQueueCommitted),
       visibleCommitted: results.some(item => item.visibleCommitted), visibleBatchPreserved: results.every(item => item.visibleBatchPreserved) };
     if (revision === recommendationUpdateRef.current.revision) {
       recommendationUpdateRef.current.latest = result;
+      recommendationUpdateRef.current.waiters?.forEach(done => done());
       // Publish the real terminal result through the existing event-driven UI
       // state, not a polling timer or a fabricated "updated" message.
       setRecommendationLoading(current => ({ ...current }));
@@ -5267,10 +5537,13 @@ export function RadioExperience() {
     const desktop = window.codioDesktop?.qqMusic;
     if (!desktop) return null;
     const revision = ++qqSyncRevisionRef.current;
+    const authorizationRevision = qqAuthorizationRevisionRef.current;
     setTasteSyncing(true);
     try {
-      const snapshot = await withTimeout(desktop.library({ force }), 10000, "QQ_LIBRARY_SYNC");
-      if (revision !== qqSyncRevisionRef.current) return null;
+      // Apply once when the bridge really completes, even if the UI's wait
+      // deadline expires first. A newer sync/account revision still wins.
+      return await withTimeout(desktop.library({ force }).then(snapshot => {
+      if (revision !== qqSyncRevisionRef.current || authorizationRevision !== qqAuthorizationRevisionRef.current) return null;
       const weights: Record<string, number> = {};
       const addTags = (tags: string[], weight: number) => tags.forEach((tag) => { weights[tag] = (weights[tag] || 0) + weight; });
       snapshot.topArtists.forEach((artist) => {
@@ -5302,8 +5575,9 @@ export function RadioExperience() {
       }));
       requestRecommendationUpdate("qq_library_synced");
       return snapshot;
+      }), 10000, "QQ_LIBRARY_SYNC");
     } catch {
-      setToast("QQ library analysis needs a fresh authorization check");
+      setToast("收藏读取暂未完成；连接保留，成功后会自动补齐推荐");
       return null;
     } finally {
       if (revision === qqSyncRevisionRef.current) setTasteSyncing(false);
@@ -5481,7 +5755,7 @@ export function RadioExperience() {
           <SafeRecommendationCover src={cover} fallbackSrc={resolved?.fallbackCover} />
         </span>
         <span className="experiment-copy"><strong>{track.title}</strong><small>{track.artist} · {track.reason}</small></span>
-        <span className="edge-distance">{listeningStatus(listeningMemory, canonicalTrackKey("qq", resolved.mid)).effective || listeningStatus(listeningMemory, canonicalTrackKey("qq", resolved.mid)).liked || qqTasteSnapshotRef.current?.tracks.some((item) => item.mid === resolved.mid) ? "FAMILIAR" : "NEW"}</span>
+        <span className="edge-distance">{familiarRecommendationIds.has(canonicalTrackKey(resolved.provider || "qq", resolved.mid)) ? "FAMILIAR" : "NEW"}</span>
         <button className={likedTracks.has(canonicalTrackKey("qq", resolved.mid)) ? "noted" : ""} title="这首不错，只用于理解你的品味" onClick={(event) => { event.stopPropagation(); rememberExperiment(track); }}>
           {likedTracks.has(canonicalTrackKey("qq", resolved.mid)) ? "NOTED" : "THIS ONE"}
         </button>
@@ -5538,7 +5812,7 @@ export function RadioExperience() {
     && (matchedExperiments.length < 12 || visibleExperiments.length < 12);
   const bootPreparationStage = bootResourceError ? "Retrying artwork and layout checks…"
     : bootSourceError ? "Some playback links could not be prepared. Please try again."
-    : bootWaveformError ? "The first track's waveform could not be prepared. Please try again."
+    : bootWaveformError ? "The first track's waveform is not ready yet. Please retry."
     : bootRecommendationsUnavailable ? "Not enough verified matches yet. Please try again."
     : qqConnection === "error" ? "Music connection check failed. Please try again."
     : bootSourcesUnavailable() ? "The music sources need another check…"
@@ -5560,6 +5834,22 @@ export function RadioExperience() {
     : !bootLayoutReady ? "Loading homepage covers and checking the layout…"
     : !bootAnimationDone ? "Finishing the opening animation…"
     : "Finishing the homepage…";
+
+  queueSelectionRef.current = (track, index) => {
+    if ("mid" in track) void selectQQTrack(track, playQueueRef.current);
+    else selectTrack(index);
+  };
+  const incomingQueueTrackId = transitionDisplay?.incoming.track.mid || "";
+  const nowPlayingQueueRows = useMemo(() => nowPlayingQueue.map((track, index) => {
+    const isQQTrack = "mid" in track;
+    const active = isQQTrack ? index === activeQueueIndex : index === trackIndex;
+    return <button key={isQQTrack ? track.mid : track.title}
+      className={`${active ? "active" : ""} ${isQQTrack && track.mid === incomingQueueTrackId ? "transition-target" : ""}`}
+      onClick={() => queueSelectionRef.current(track, index)}>
+      <span>{active ? "▶" : String(index + 1).padStart(2, "0")}</span>
+      <strong>{track.title}</strong><small>{track.artist}</small>
+    </button>;
+  }), [nowPlayingQueue, activeQueueIndex, trackIndex, incomingQueueTrackId]);
 
   return (
     <div
@@ -6052,21 +6342,7 @@ export function RadioExperience() {
         <aside className="np-edge np-edge-left" onWheel={(event) => event.stopPropagation()}>
           <small>UP NEXT</small>
           <div className="np-queue-list">
-            {nowPlayingQueue.map((track, index) => {
-              const isQQTrack = "mid" in track;
-              const active = isQQTrack ? index === activeQueueIndex : index === trackIndex;
-              return (
-                <button
-                  key={isQQTrack ? track.mid : track.title}
-                  className={`${active ? "active" : ""} ${transitionDisplay && isQQTrack && track.mid === transitionDisplay.incoming.track.mid ? "transition-target" : ""}`}
-                  onClick={() => isQQTrack ? void selectQQTrack(track, playQueue) : selectTrack(index)}
-                >
-                  <span>{active ? "▶" : String(index + 1).padStart(2, "0")}</span>
-                  <strong>{track.title}</strong>
-                  <small>{track.artist}</small>
-                </button>
-              );
-            })}
+            {nowPlayingQueueRows}
           </div>
         </aside>
 

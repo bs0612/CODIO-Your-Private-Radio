@@ -25,9 +25,10 @@ function validateToolArguments(name, args) {
   if (name === "rate_current_track") return hasOnlyKeys(args, ["rating"]) && ["like", "dislike"].includes(args.rating);
   if (name === "record_music_preference") {
     if (!["more", "less"].includes(args.value)) return false;
-    if (args.target_type === "track") return hasOnlyKeys(args, ["target_type", "track_id", "value"]) && typeof args.track_id === "string" && args.track_id.trim().length > 0 && args.track_id.length <= 128;
-    if (args.target_type === "artist") return hasOnlyKeys(args, ["target_type", "artist_name", "value"]) && typeof args.artist_name === "string" && args.artist_name.trim().length > 0 && args.artist_name.length <= 120;
-    if (args.target_type === "feature") return hasOnlyKeys(args, ["target_type", "feature_key", "value"]) && args.feature_key === "instrumental";
+    if (args.evidence_text !== undefined && (typeof args.evidence_text !== "string" || !args.evidence_text.trim() || args.evidence_text.length > 400)) return false;
+    if (args.target_type === "track") return hasOnlyKeys(args, ["target_type", "track_id", "value", "evidence_text"]) && typeof args.track_id === "string" && args.track_id.trim().length > 0 && args.track_id.length <= 128;
+    if (args.target_type === "artist") return hasOnlyKeys(args, ["target_type", "artist_name", "value", "evidence_text"]) && typeof args.artist_name === "string" && args.artist_name.trim().length > 0 && args.artist_name.length <= 120;
+    if (args.target_type === "feature") return hasOnlyKeys(args, ["target_type", "feature_key", "value", "evidence_text"]) && args.feature_key === "instrumental";
     return false;
   }
   if (name === "set_session_intent") {

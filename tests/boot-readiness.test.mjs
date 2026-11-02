@@ -304,6 +304,45 @@ test("failed or cancelled initial waveform preparation cannot claim ready or ins
   }
 });
 
+test("waveform preparation still runs after entry and after connecting QQ on the homepage", async () => {
+  const h=readiness({bootPhase:"done",qqConnection:"connected",initialWaveformRef:{current:{trackId:"",waveform:[]}}}),c=h.context;
+  const wave=Array.from({length:96},(_,i)=>(i%9)/9);let calls=0;
+  c.prepareInitialWaveformRef={current:async()=>{calls++;return wave;}};
+  c.displayedWaveformRef={current:[]};c.setWaveformRevision=update=>{c.waveformRevision=update(c.waveformRevision);};
+  const cleanup=effect("INITIAL_WAVEFORM",c)();await flush();
+  assert.equal(calls,1);assert.deepEqual(c.initialWaveformRef.current.waveform,wave);assert.equal(c.waveformRevision,1);cleanup();
+});
+
+test("a later real waveform preserves the current curve for the existing smooth morph", async () => {
+  const h=readiness({bootPhase:"done",qqConnection:"connected",initialWaveformRef:{current:{trackId:"",waveform:[]}}}),c=h.context;
+  const oldCurve=Array(96).fill(.25),newCurve=Array(96).fill(.7);
+  c.prepareInitialWaveformRef={current:async()=>newCurve};c.displayedWaveformRef={current:oldCurve};c.setWaveformRevision=()=>{};
+  const cleanup=effect("INITIAL_WAVEFORM",c)();await flush();
+  assert.equal(c.displayedWaveformRef.current,oldCurve);assert.deepEqual(c.initialWaveformRef.current.waveform,newCurve);cleanup();
+});
+
+test("a real waveform completing after the UI deadline still finishes startup without a second job", async () => {
+  const h=readiness({qqConnection:"connected",initialWaveformRef:{current:{trackId:"",waveform:[]}}}),c=h.context,pending=deferred();
+  let expire,calls=0;
+  c.prepareInitialWaveformRef={current:()=>{calls++;return pending.promise;}};
+  c.withTimeout=(_promise,ms,label)=>{assert.equal(ms,32000);return new Promise((_resolve,reject)=>{expire=()=>reject(Error(label));});};
+  c.displayedWaveformRef={current:[]};c.setWaveformRevision=update=>{c.waveformRevision=update(c.waveformRevision);};
+  const cleanup=effect("INITIAL_WAVEFORM",c)();expire();await flush();
+  assert.equal(c.bootWaveformError,true,"retry is available while the original job remains observed");
+  assert.equal(c.homePreparedForBoot(),false);assert.equal(calls,1);
+  pending.resolve(Array(96).fill(.4));await flush();
+  assert.equal(c.initialWaveformRef.current.trackId,"match-0");assert.equal(c.waveformRevision,1);
+  assert.equal(c.bootWaveformError,false);assert.equal(c.homePreparedForBoot(),true);assert.equal(calls,1);cleanup();
+});
+
+test("a truly failed late waveform still blocks entry instead of fabricating ready", async () => {
+  const h=readiness({qqConnection:"connected",initialWaveformRef:{current:{trackId:"",waveform:[]}}}),c=h.context,pending=deferred();let expire;
+  c.prepareInitialWaveformRef={current:()=>pending.promise};c.withTimeout=()=>new Promise((_resolve,reject)=>{expire=()=>reject(Error("deadline"));});
+  c.displayedWaveformRef={current:[]};c.setWaveformRevision=()=>assert.fail("no measured waveform means no ready revision");
+  const cleanup=effect("INITIAL_WAVEFORM",c)();expire();await flush();pending.resolve(null);await flush();
+  assert.equal(c.bootWaveformError,true);assert.equal(c.homePreparedForBoot(),false);cleanup();
+});
+
 test("home paints behind the opening screen before two separate final frame checks",async()=>{
   const h=readiness({qqConnection:"connected",bootPainting:false});
   h.run();assert.equal(h.context.bootPainting,true);assert.equal(h.frames.length,0);assert.equal(h.readyCalls(),0);

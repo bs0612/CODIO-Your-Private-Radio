@@ -94,11 +94,11 @@ test("source signature and actual media duration must match the cached endpoint 
   assert.equal(dj.isTrackAnalysisSourceValid({ ...result, silence: { ...result.silence, windowSeconds: NaN } }, "test-tail", signature, 35), false);
 });
 
-test("a reliable sound endpoint can produce a safe audible handoff without a beat plan", () => {
+test("a reliable sound endpoint still provides a short safe handoff when incoming analysis is absent", () => {
   const outgoing = analyze([pcm(35, time => time < 20 ? .15 : 0)]);
   const incoming = analyze([pcm(30)]);
   const weak = { tempoStable: false, beatGridConfidence: .1, phraseConfidence: 0, analysisConfidence: .1 };
-  const plan = dj.planTransition({ ...outgoing, ...weak }, { ...incoming, ...weak }, "safe-boundary");
+  const plan = dj.planSilenceHandoff({ ...outgoing, ...weak }, null, incoming.trackId, "safe-boundary");
   assert.equal(plan.boundaryHandoff, true);
   assert.equal(dj.isTransitionPlanUsable(plan, outgoing.trackId, incoming.trackId), true);
   assert.equal(plan.incomingCue, 0);
@@ -108,6 +108,15 @@ test("a reliable sound endpoint can produce a safe audible handoff without a bea
   const lastSoundIndex = Math.floor((outgoing.silence.lastAudibleTime - plan.outgoingCue) / plan.transitionDuration * 63);
   assert.ok(plan.outgoingGainCurve[lastSoundIndex - 1] > .999);
   for (const field of ["incomingLowCurve", "incomingMidCurve", "incomingHighCurve", "outgoingLowCurve", "outgoingMidCurve", "outgoingHighCurve"]) assert.ok(plan[field].every(value => value === 1));
+});
+
+test("two analysed songs without a beat lock blend rather than always collapsing into a subsecond tail handoff", () => {
+  const outgoing=analyze([pcm(35,time=>time<20?.15:0)]),incoming=analyze([pcm(30)],"incoming");
+  const weak={tempoStable:false,beatGridConfidence:.1,phraseConfidence:0,analysisConfidence:.1};
+  const plan=dj.planTransition({...outgoing,...weak},{...incoming,...weak});
+  assert.equal(plan.strategy,"breakdown-bridge");assert.notEqual(plan.boundaryHandoff,true);
+  assert.ok(plan.transitionDuration>1);close(plan.outgoingCue+plan.transitionDuration,outgoing.effectiveEnd);
+  assert.equal(plan.incomingCue,0);assert.equal(plan.incomingTempoRatio,1);
 });
 
 test("only measured leading silence is removed: late musical safeIn cues never eat an intro", () => {

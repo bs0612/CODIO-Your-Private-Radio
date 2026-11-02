@@ -879,7 +879,7 @@ async function metadataHarness(t, { directory, now = 1000000000, request } = {})
     codioDataDirectories: { cache: directory }, app: { getPath: () => assert.fail("never access real userData/cache") },
     QQ_MUSICU_URL: "https://catalog.invalid/metadata", SONG_METADATA_TTL_MS: 7 * 24 * 60 * 60 * 1000, SONG_METADATA_LIMIT: actualMetadataLimit,
     songMetadataCache: new Map(), songMetadataPending: new Map(), songMetadataDiskLoaded: null,
-    songMetadataWritePending: Promise.resolve(), songMetadataActive: 0, songMetadataWaiters: [],
+    songMetadataWritePending: null, songMetadataWriteDirty: false, songMetadataActive: 0, songMetadataWaiters: [],
     requestQQJson: async (url, options) => {
       const id = JSON.parse(new URL(url).searchParams.get("data")).req_0.param.song_mid;
       calls.push({ id, options });
@@ -890,7 +890,13 @@ async function metadataHarness(t, { directory, now = 1000000000, request } = {})
   };
   const names = ["qqMetadataCacheFile", "normalizeQQMetadata", "loadQQMetadataCache", "persistQQMetadataCache", "readQQTrackMetadata"];
   Object.assign(c, bind(names, c));
-  return { c, calls, directory, setTime: value => { clock = value; }, read: id => c.readQQTrackMetadata(null, id) };
+  return { c, calls, directory, setTime: value => { clock = value; }, readRaw: id => c.readQQTrackMetadata(null, id), read: async id => {
+    const result = await c.readQQTrackMetadata(null, id);
+    // Disk assertions explicitly flush optional catalogue work. Production IPC
+    // is intentionally tested separately without this fixture-only wait.
+    while (c.songMetadataWritePending) await c.songMetadataWritePending;
+    return result;
+  } };
 }
 
 test("verified metadata persists catalog evidence and a new process reads through without a provider call", async (t) => {
@@ -978,6 +984,41 @@ test("metadata memory entries expire, preserve single-flight failure release and
   await h.read("song0"); assert.equal(h.calls.length, calls);
   h.setTime(1000000000 + h.c.SONG_METADATA_TTL_MS);
   await h.read("song0"); assert.equal(h.calls.length, calls + 1);
+});
+
+test("metadata IPC releases provider slots before optional disk persistence and coalesces a whole burst", async t => {
+  const h = await metadataHarness(t), timers = [];
+  let writes = 0;
+  h.c.setTimeout = callback => { timers.push(callback); return timers.length; };
+  h.c.fs = { ...fs, writeFile: async (...args) => { writes++; return fs.writeFile(...args); } };
+  const results = await Promise.all(Array.from({ length: 40 }, (_, i) => h.readRaw(`burst${i}`)));
+  assert.ok(results.every(item => item.ok)); assert.equal(h.c.songMetadataActive, 0);
+  assert.equal(writes, 0, "Verified metadata returned without waiting for the debounce or filesystem");
+  assert.equal(timers.length, 1); timers[0](); await h.c.songMetadataWritePending;
+  assert.equal(writes, 1, "Forty results produce one atomic snapshot, not forty full rewrites");
+  const saved = JSON.parse(await readFile(path.join(h.directory, "qq-song-metadata-v1.json"), "utf8"));
+  assert.equal(saved.entries.length, 40); assert.equal(h.c.songMetadataWritePending, null);
+});
+
+test("metadata arriving during a disk write gets one serial follow-up; disk failure never invalidates verified metadata", async t => {
+  const h = await metadataHarness(t), timers = [];
+  let release, started, writes = 0, active = 0, maximum = 0;
+  const writing = new Promise(resolve => { started = resolve; }), gate = new Promise(resolve => { release = resolve; });
+  h.c.setTimeout = callback => { timers.push(callback); return timers.length; };
+  h.c.fs = { ...fs, writeFile: async (...args) => {
+    writes++; active++; maximum = Math.max(maximum, active);
+    try { if (writes === 1) { started(); await gate; } return await fs.writeFile(...args); }
+    finally { active--; }
+  } };
+  assert.ok((await h.readRaw("first" )).ok); timers[0](); await writing;
+  assert.ok((await h.readRaw("duringWrite")).ok); assert.equal(h.c.songMetadataActive, 0);
+  release(); await h.c.songMetadataWritePending;
+  assert.equal(writes, 2); assert.equal(maximum, 1);
+  const saved = JSON.parse(await readFile(path.join(h.directory, "qq-song-metadata-v1.json"), "utf8"));
+  assert.deepEqual(saved.entries.map(item => item.value.mid), ["first", "duringWrite"]);
+  h.c.fs.writeFile = async () => { throw Error("isolated disk unavailable"); };
+  assert.ok((await h.readRaw("diskFailure")).ok); timers.at(-1)(); await h.c.songMetadataWritePending;
+  assert.equal(h.c.songMetadataWritePending, null); assert.ok((await h.readRaw("diskFailure")).ok);
 });
 
 test("actual library IPC isolates owner snapshots/single-flight and explicit force bypasses returning-user cache", async (t) => {

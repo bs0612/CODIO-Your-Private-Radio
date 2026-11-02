@@ -238,6 +238,27 @@ test("search direct play continues from the selected queue position while the ap
   assert.equal(h.playing(), true);
 });
 
+test("NEXT never switches or resumes a paused, ended or not-yet-sourced current deck", async () => {
+  for (const state of [{paused:true},{ended:true},{src:""}]) {
+    const [current, requested, later] = ["current", "requested", "later"].map(track);
+    const h = harness({active:current,queue:[current,later]});
+    Object.assign(h.audio(), state);
+    await h.handlers.enqueueNext(requested);
+    assert.deepEqual(h.queue().map(item => item.mid), ["current","requested","later"]);
+    assert.equal(h.current().mid, current.mid); assert.equal(h.index(), 0);
+    assert.ok(!h.calls.some(([kind]) => ["start","transition","toggle"].includes(kind)));
+    for (const [key,value] of Object.entries(state)) assert.equal(h.audio()[key], value);
+  }
+});
+
+test("NEXT on an empty player only enqueues, without creating playback or consuming the first slot", async () => {
+  const h=harness(),requested=track("requested");
+  await h.handlers.enqueueNext(requested);
+  assert.deepEqual(h.queue().map(item => item.mid), [requested.mid]);
+  assert.equal(h.current(), null); assert.equal(h.audio(), null); assert.equal(h.index(), -1);
+  assert.ok(!h.calls.some(([kind]) => ["start","transition","toggle"].includes(kind)));
+});
+
 test("Add Next stays directly after the current track and starts on natural end", async () => {
   const [current, requested, later] = ["current", "requested", "later"].map(track);
   const h = harness({ active: current, queue: [current, later] });
@@ -290,7 +311,7 @@ test("transition commit relocates its queue index after a concurrent insert", ()
     setCurrentCoverData() {}, setPlaybackQuality() {}, setProgress() {},
     setPlaybackTime() {}, setLyricLines() {}, setIsPlaying() {},
     rememberPlayedTrack() {}, beginListeningForTrack() {}, recommendationSourceForTrack() { return "queue"; },
-    armPlaybackBoundaryCheck() {},
+    armPlaybackBoundaryCheck() {}, record() {}, outgoingSnapshotAnalysis: { effectiveEnd: 180 },
   };
   bindCommit(context)();
   assert.equal(activeQQTrackLiveRef.current.mid, "incoming");

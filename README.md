@@ -2,7 +2,7 @@
 
 **陌生的歌曲，熟悉的听感。 / Unfamiliar songs. A familiar feeling.**
 
-[中文](#中文) · [English](#english) · [Windows 下载 / Download](https://github.com/bs0612/CODIO-Your-Private-Radio/releases/download/v0.1.7-preview.20261027/CODIO-0.1.7-Windows-x64-20261027.zip) · [Releases](https://github.com/bs0612/CODIO-Your-Private-Radio/releases) · [MIT License](LICENSE)
+[中文](#中文) · [English](#english) · [Windows 下载 / Download](https://github.com/bs0612/CODIO-Your-Private-Radio/releases/download/v0.1.7-preview.20261102/CODIO-0.1.7-Windows-x64-20261102.zip) · [Releases](https://github.com/bs0612/CODIO-Your-Private-Radio/releases) · [MIT License](LICENSE)
 
 ## 中文
 
@@ -10,7 +10,7 @@ CODIO 是一款 Windows 私人音乐电台，把推荐、听歌记忆、AI DJ、
 
 ### 下载与使用
 
-**[下载 Windows 10/11 x64 便携版](https://github.com/bs0612/CODIO-Your-Private-Radio/releases/download/v0.1.7-preview.20261027/CODIO-0.1.7-Windows-x64-20261027.zip)** · [更新说明与 SHA-256](https://github.com/bs0612/CODIO-Your-Private-Radio/releases/tag/v0.1.7-preview.20261027)
+**[下载 Windows 10/11 x64 便携版](https://github.com/bs0612/CODIO-Your-Private-Radio/releases/download/v0.1.7-preview.20261102/CODIO-0.1.7-Windows-x64-20261102.zip)** · [更新说明与 SHA-256](https://github.com/bs0612/CODIO-Your-Private-Radio/releases/tag/v0.1.7-preview.20261102)
 
 1. 完整解压 ZIP 后运行 `CODIO.exe`，不要只复制 EXE 或在压缩包里直接运行。
 2. 不需要注册 CODIO 账户；按需连接自己的 QQ 音乐。可播放歌曲取决于平台、地区、会员权限和网络。
@@ -45,7 +45,7 @@ CODIO is a Windows personal music radio combining recommendations, listening mem
 
 ### Download and get started
 
-**[Download the Windows 10/11 x64 portable app](https://github.com/bs0612/CODIO-Your-Private-Radio/releases/download/v0.1.7-preview.20261027/CODIO-0.1.7-Windows-x64-20261027.zip)** · [Release notes and SHA-256](https://github.com/bs0612/CODIO-Your-Private-Radio/releases/tag/v0.1.7-preview.20261027)
+**[Download the Windows 10/11 x64 portable app](https://github.com/bs0612/CODIO-Your-Private-Radio/releases/download/v0.1.7-preview.20261102/CODIO-0.1.7-Windows-x64-20261102.zip)** · [Release notes and SHA-256](https://github.com/bs0612/CODIO-Your-Private-Radio/releases/tag/v0.1.7-preview.20261102)
 
 1. Extract the entire ZIP, then run `CODIO.exe`. Do not run it inside the archive or copy the EXE alone.
 2. No CODIO account is required. Connect your own QQ Music account if needed; playback depends on service availability, region, membership and network access.

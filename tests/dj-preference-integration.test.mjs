@@ -7,7 +7,7 @@ import ts from "typescript";
 // QQ, storage, timers, and React state are isolated: no user data is touched.
 const source = await readFile(new URL("../app/RadioExperience.tsx", import.meta.url), "utf8");
 const ast = ts.createSourceFile("RadioExperience.tsx", source, ts.ScriptTarget.Latest, true, ts.ScriptKind.TSX);
-const handlerNames = ["recommendationIdentity", "enrichTrackMetadata", "featureVectorForTrack", "writeTrackPreference", "supplementAnalyzedPreferences", "updateListeningMemory", "requestRecommendationUpdate", "executeCodioTool", "replyTo", "withdrawPreference", "buildCodioContext"];
+const handlerNames = ["recommendationIdentity", "enrichTrackMetadata", "featureVectorForTrack", "writeTrackPreference", "supplementAnalyzedPreferences", "updateListeningMemory", "requestRecommendationUpdate", "executeCodioTool", "replyTo", "withdrawPreference", "buildCodioContext", "runAgentTurn"];
 const declarations = new Map();
 function visit(node) {
   if (ts.isFunctionDeclaration(node) && node.name && handlerNames.includes(node.name.text)) {
@@ -116,6 +116,7 @@ function harness({ results = [valentina, always], hydrated = true } = {}) {
     async togglePlayback() { playbackCalls.push("togglePlayback"); },
     async nextTrack() { playbackCalls.push("nextTrack"); },
     async previousTrack() { playbackCalls.push("previousTrack"); },
+    async waitForRecommendationUpdate() { /* This harness tests Agent permission; real completion is covered by the queue harness. */ },
   };
   const handlers = bindHandlers(context);
   return {
@@ -163,6 +164,36 @@ function assertVisibleAndPlaybackStable(h, before) {
   assert.equal(h.storage.get("codio-taste-signals"), "legacy-history");
 }
 
+test("production Agent rechecks actual QQ status and resumes the earlier style preference after a connection confirmation", async () => {
+  const h=harness({results:[track("verified-sun-song","Known song","孙燕姿")]}),before=h.shown();
+  const original="I am addicted to 孙燕姿 recently, I really like her style and flow";
+  Object.assign(h.context,{qqConnection:"needs-auth",qqPlaybackReady:false,pendingDjPreferenceRef:{current:null},
+    recommendationVisibleRef:{current:before},recommendationScoresRef:{current:new Map()},volumeRef:{current:35},seamlessRef:{current:true},
+    progress:0,timeContext:"Evening",weatherContext:"Weather off",nowPlayingOpen:false});
+  let connected=false,round=0;const snapshots=[],statusCalls=[];
+  h.context.window.codioDesktop.qqMusic.getStatus=async options=>{statusCalls.push(options);return{loggedIn:connected,playbackReady:connected};};
+  h.context.window.codioDesktop.ai={step:async request=>{
+    snapshots.push(request.context);
+    if(!connected)return round++===0?response(search("before-connect")):{content:"搜索暂时不可用；偏好没有保存。",toolCalls:[]};
+    assert.equal(request.context.library.connected,true,"must not reuse the old renderer needs-auth closure");
+    assert.equal(request.context.resumedPreferenceRequest,original);
+    if(round++===0)return response(search("after-connect"));
+    if(round===2)return response(preferArtist("save-artist","孙燕姿"));
+    assert.equal(request.context.listening.activeFeedbackScopes[0].artist,"孙燕姿");
+    return{content:"已记下你喜欢孙燕姿，后续推荐重排已排队，当前列表保持不变。",toolCalls:[]};
+  }};
+  await h.handlers.runAgentTurn(original,[{role:"user",content:original}]);
+  assert.equal(intelligence.activePreferences(h.memory()).length,0);assert.equal(h.context.pendingDjPreferenceRef.current.text,original);
+  connected=true;round=0;
+  const reply=await h.handlers.runAgentTurn("我已经连上了啊",[{role:"user",content:original},{role:"assistant",content:"偏好尚未保存"},{role:"user",content:"我已经连上了啊"}]);
+  const saved=intelligence.activePreferences(h.memory());assert.equal(saved.length,1);assert.equal(saved[0].targetKey,"孙燕姿");assert.equal(saved[0].source,"dj");
+  assert.equal(h.context.pendingDjPreferenceRef.current,null);assert.match(reply,/已记下/);
+  assert.ok(statusCalls.every(options=>options.recover===false),"chat status reads must not open login/recovery windows");
+  assert.equal(snapshots[0].library.connected,false);assert.equal(snapshots.at(-1).library.connected,true);
+  assertVisibleAndPlaybackStable(h,before);await h.flushTimers();assert.deepEqual(h.refreshes,["feedback"]);
+  assertVisibleAndPlaybackStable(h,before);
+});
+
 test("mixed-language preference uses the production executor and shared persisted memory without playback or replacing the visible batch", async () => {
   const songs = [track("fixture-wind", "风衣", "孙燕姿"), track("fixture-vortex", "漩涡", "孙燕姿")];
   const h = harness({ results: songs }), before = h.shown();
@@ -177,6 +208,13 @@ test("mixed-language preference uses the production executor and shared persiste
   await h.flushTimers();
   assert.deepEqual(h.refreshes, ["feedback"]);
   assertVisibleAndPlaybackStable(h, before);
+});
+
+test("an unavailable live status check is not reported as proof of a disconnected QQ account", async () => {
+  const h=harness();h.context.qqConnection="needs-auth";
+  const result=await h.handlers.executeCodioTool(search(),new Map(),"我喜欢 Daniel 的歌",{loggedIn:false,playbackReady:false,statusVerified:false});
+  assert.equal(result.ok,false);assert.equal(result.error,"QQ_STATUS_UNAVAILABLE");assert.equal(h.searchCalls.length,0);
+  assert.equal(intelligence.activePreferences(h.memory()).length,0);
 });
 
 test("playback tool rejects requested-success fiction: unconnected, no source, and all failed successors",async()=>{

@@ -241,6 +241,16 @@ test("a failed preparation is removed and the same identity can recover immediat
   assert.ok(await h.handlers.prepareTrack(track)); assert.equal(h.calls(), 2);
 });
 
+test("upcoming-deck preparation renews a nearly expired ticket before the mix and reuses the renewal",async()=>{
+  const h=harness(),track=item("renew-before-cue");let now=100000;
+  h.c.Date={now:()=>now};
+  const old=await h.handlers.prepareTrack(track,true);
+  now=old.expiresAt-20000;
+  const renewed=await h.handlers.prepareTrack(track,true,45000);
+  assert.equal(h.calls(),2);assert.notEqual(renewed.playback.url,old.playback.url);assert.ok(renewed.expiresAt>old.expiresAt);
+  assert.equal(await h.handlers.prepareTrack(track,true,45000),renewed);assert.equal(h.calls(),2,"reuse the renewed request");
+});
+
 test("old failed requests cannot delete a newer preparation entry", async () => {
   const h = harness(); const track = item("revision"); let reject;
   h.c.window.codioDesktop.qqMusic.play = () => new Promise((_, r) => { reject = r; });
@@ -510,7 +520,7 @@ test("warm owner-checked batches verify all 24 actual sources without waiting fo
     qqTasteSnapshotRef: { current: { tracks: Array.from({ length: 12 }, (_, i) => ({ ...item(`library${i}`), provider: "qq" })), topArtists: [] } },
     experimentPool: [], artistTasteHints: [], recommendationAudioRef: { current: new Map() }, trackAnalysisRef: { current: new Map() },
     metadataEnrichmentRef: { current: { active: 0, waiters: [], pending: new Map() } }, analysisLifecycleRef: { current: { mounted: true } },
-    recommendationTracksRef: { current: {} }, discoveryTracksRef: { current: {} }, failedTracksRef: { current: new Map() },
+    recommendationTracksRef: { current: {} }, discoveryTracksRef: { current: {} }, discoveryPoolRef: { current: [] }, failedTracksRef: { current: new Map() },
     activeQQTrackLiveRef: { current: null }, activeTransitionRef: { current: null }, seamlessTransitionRef: { current: false },
     recommendationCatalogRef: { current: [] }, recommendationScoresRef: { current: new Map() },
     weatherSnapshotRef: { current: { text: "Clear" } }, weatherContext: "Clear", manualQueueIdsRef: { current: new Set() },

@@ -152,6 +152,8 @@ Use tools when the user asks CODIO to operate the player. Never claim an action 
 Treat named music preference, temporary listening intent, and ordinary conversation as different requests. For "我最近特别喜欢 Daniel 的 Valentina 和 Always，其他他的歌也挺好听", call search_music for "Valentina" and "Always" together first. Search each song title alone: QQ search for "Daniel Valentina" may return unrelated songs. Inspect exact returned titles and artists; "Always (Explicit)" can verify the base title "Always", and "Daniel Caesar" can verify "Daniel" only when the matching songs point to that one artist. Ignore unrelated search hits. Then call record_music_preference for the two verified track ids and the full returned artist name together; do not play anything. Two searches plus three records fit one turn. If no matching result, retry a different query; if artists or versions remain ambiguous, ask the user to clarify. Never invent a track id or artist.
 Record a lasting preference only when the user explicitly expresses their own liking or disliking of a named song, artist, or supported music category. For "我不喜欢纯音乐", call record_music_preference with target_type="feature", feature_key="instrumental", value="less", without QQ search or changing playback. Category preferences do not dislike the current song or any artist. The only supported category is instrumental; it applies only to confirmed song-level metadata or explicit version annotations. Missing lyrics are not evidence of instrumental music; unclassified songs remain unknown. Questions, quotations, third-person opinions, ordinary chat, and temporary requests such as "今晚不想听纯音乐" must not become lasting preferences. If a requested temporary dimension is unsupported, explain that boundary instead of claiming it was saved. A dislike of one track stays at track scope; never expand it to the artist. Use set_session_intent for supported dimensions of what the user wants to hear now or tonight; it must not change their long-term profile. Ordinary chat needs no action.
 search_music only verifies candidates. It does not save a preference, refresh recommendations, or play audio. play_search_result and control_playback require an actual user playback request. Preference changes affect the pending recommendation queue; the 24 visible songs stay in place until the user requests REFRESH.
+Natural first-person liking of a verified artist's music/style/flow is sufficient permission for an artist preference; do not require a magic phrase such as "记下来". If resumedPreferenceRequest is present in current context, it is the user's recent unresolved request resumed after a connection confirmation. Verify the identity again with search_music in this turn, then perform only that request; do not ask the user to repeat the original liking. library.connected describes the current account, while library.playbackReady is a separate capability. Do not invent a disconnected account when only playback is unavailable or statusVerified is false.
+For a lasting preference expressed in natural wording, pass evidence_text: an exact, verbatim span from the current user message (or resumedPreferenceRequest) that states that preference. Interpret the meaning yourself, rather than asking for a fixed phrase. For artist scope quote an artist-level opinion, not an opinion about just one named song. For track scope quote the named-song opinion. Do not manufacture a quote, save ordinary conversation, infer a lasting taste from a one-time listening request, or play a song merely because it was liked. If an operation is rejected, use the error to clarify only the genuinely missing fact; never coach the user to recite a password-like phrase.
 Use the structured tool results as the only evidence of what was saved, what failed, and when recommendations change. "queued" means only scheduled, not committed. Give a concise natural final answer after observing tool results; mention saved preferences and the actual recommendation status, without raw JSON or an invented thinking process. Explain failures in natural Chinese.
 For user-profile claims, cite only evidence present in context. If evidence is insufficient, say 我还不能确定.
 Never invent MBTI, turn a session intent into a long-term preference, turn one skip into a lasting dislike, or expand track feedback to an artist/style.
@@ -163,7 +165,7 @@ const CODIO_AI_TOOLS = [
   { type: "function", function: { name: "seek_playback", description: "Seek within the current track by percentage.", parameters: { type: "object", properties: { position_percent: { type: "number", minimum: 0, maximum: 100 } }, required: ["position_percent"] } } },
   { type: "function", function: { name: "adjust_volume", description: "Set or relatively adjust player volume.", parameters: { type: "object", properties: { operation: { type: "string", enum: ["set", "increase", "decrease"] }, value: { type: "number", minimum: 0, maximum: 100 } }, required: ["operation", "value"] } } },
   { type: "function", function: { name: "search_music", description: "Search QQ Music and return turn-scoped track ids. For named preferences, query each SONG TITLE alone first and batch multiple searches in one response; combined artist-title queries can miss the song. Ignore unrelated hits and retry only when needed.", parameters: { type: "object", properties: { query: { type: "string", minLength: 1, maxLength: 120 }, limit: { type: "integer", minimum: 1, maximum: 10 } }, required: ["query"] } } },
-  { type: "function", function: { name: "record_music_preference", description: "Save the user's explicit long-term preference. Track/artist requires search verification; feature instrumental needs no QQ search and never changes playback. Only record a direct first-person lasting preference, not a question, quote or temporary request. Instrumental classification uses confirmed metadata/version annotation, never missing lyrics. One song dislike never becomes an artist/style dislike.", parameters: { type: "object", properties: { target_type: { type: "string", enum: ["track", "artist", "feature"] }, track_id: { type: "string", description: "Required only for track, from search_music in this turn" }, artist_name: { type: "string", description: "Required only for artist: pass the FULL artist string returned by search_music, even if the user used a unique shorter name" }, feature_key: { type: "string", enum: ["instrumental"], description: "Required only for feature; this is a category preference, not a measured vocal ratio" }, value: { type: "string", enum: ["more", "less"] } }, required: ["target_type", "value"] } } },
+  { type: "function", function: { name: "record_music_preference", description: "Save the user's explicit long-term preference. Track/artist requires search verification; feature instrumental needs no QQ search and never changes playback. Interpret natural preference wording and quote the supporting user span in evidence_text. A song opinion never automatically becomes an artist preference. Not for questions, reported speech, ordinary chat or temporary requests.", parameters: { type: "object", properties: { target_type: { type: "string", enum: ["track", "artist", "feature"] }, track_id: { type: "string", description: "Required only for track, from search_music in this turn" }, artist_name: { type: "string", description: "Required only for artist: pass the FULL artist string returned by search_music, even if the user used a unique shorter name" }, feature_key: { type: "string", enum: ["instrumental"], description: "Required only for feature; this is a category preference, not a measured vocal ratio" }, evidence_text: { type: "string", minLength: 1, maxLength: 400, description: "Verbatim user span stating this lasting preference; artist scope needs an artist-level span, track scope needs the named song" }, value: { type: "string", enum: ["more", "less"] } }, required: ["target_type", "value", "evidence_text"] } } },
   { type: "function", function: { name: "set_session_intent", description: "Set what to hear now or tonight without changing long-term taste. Only include dimensions explicitly supported by the user's words.", parameters: { type: "object", minProperties: 1, properties: { familiarity: { type: "string", enum: ["familiar", "balanced", "explore"] }, energy: { type: "string", enum: ["calm", "balanced", "energetic"] }, flow: { type: "string", enum: ["continuous", "balanced", "varied"] } } } } },
   { type: "function", function: { name: "play_search_result", description: "Play one result returned by search_music in this same turn.", parameters: { type: "object", properties: { track_id: { type: "string" } }, required: ["track_id"] } } },
   { type: "function", function: { name: "set_seamless", description: "Enable or disable seamless transitions.", parameters: { type: "object", properties: { enabled: { type: "boolean" } }, required: ["enabled"] } } },
@@ -726,7 +728,8 @@ const songMetadataPending = new Map();
 const SONG_METADATA_TTL_MS = 7 * 24 * 60 * 60 * 1000;
 const SONG_METADATA_LIMIT = 1200;
 let songMetadataDiskLoaded = null;
-let songMetadataWritePending = Promise.resolve();
+let songMetadataWritePending = null;
+let songMetadataWriteDirty = false;
 let songMetadataActive = 0;
 const songMetadataWaiters = [];
 
@@ -764,14 +767,25 @@ function loadQQMetadataCache() {
 }
 
 function persistQQMetadataCache() {
-  songMetadataWritePending = songMetadataWritePending.then(async () => {
-    const cacheFile = qqMetadataCacheFile(), now = Date.now();
-    const entries = [...songMetadataCache.values()].filter(entry => now >= entry.verifiedAt && now - entry.verifiedAt < SONG_METADATA_TTL_MS).slice(-SONG_METADATA_LIMIT);
-    await fs.mkdir(path.dirname(cacheFile), { recursive: true });
-    const temporary = `${cacheFile}.${process.pid}.tmp`;
-    await fs.writeFile(temporary, JSON.stringify({ version: 1, entries }));
-    await fs.rename(temporary, cacheFile);
-  }).catch(() => {}); // Disk failure cannot turn verified provider metadata into fabricated or failed identity.
+  songMetadataWriteDirty = true;
+  if (songMetadataWritePending) return songMetadataWritePending;
+  songMetadataWritePending = (async () => {
+    // Optional catalogue persistence is not part of a verified IPC response.
+    // Collapse bursts to one snapshot; updates during a write get a serial follow-up.
+    await new Promise(resolve => setTimeout(resolve, 200));
+    while (songMetadataWriteDirty) {
+      songMetadataWriteDirty = false;
+      const cacheFile = qqMetadataCacheFile(), now = Date.now();
+      const entries = [...songMetadataCache.values()].filter(entry => now >= entry.verifiedAt && now - entry.verifiedAt < SONG_METADATA_TTL_MS).slice(-SONG_METADATA_LIMIT);
+      await fs.mkdir(path.dirname(cacheFile), { recursive: true });
+      const temporary = `${cacheFile}.${process.pid}.tmp`;
+      await fs.writeFile(temporary, JSON.stringify({ version: 1, entries }));
+      await fs.rename(temporary, cacheFile);
+    }
+  })().catch(() => {}).finally(() => {
+    songMetadataWritePending = null;
+    if (songMetadataWriteDirty) void persistQQMetadataCache();
+  }); // Disk failure cannot invalidate verified provider metadata or log credentials.
   return songMetadataWritePending;
 }
 
@@ -803,7 +817,7 @@ async function readQQTrackMetadata(_event, rawId) {
       if (!metadata) return { ok: false, error: "METADATA_UNKNOWN" };
       songMetadataCache.set(id, { value: metadata, verifiedAt: Date.now() });
       while (songMetadataCache.size > SONG_METADATA_LIMIT) songMetadataCache.delete(songMetadataCache.keys().next().value);
-      await persistQQMetadataCache();
+      void persistQQMetadataCache();
       return metadata;
     } catch { return { ok: false, error: "METADATA_UNAVAILABLE" }; }
     finally { const next = songMetadataWaiters.shift(); if (next) next(); else songMetadataActive--; }
@@ -1342,7 +1356,7 @@ app.whenReady().then(async () => {
       mainWindow.webContents.send("codio:system-volume-changed", status);
     }
   });
-  ipcMain.handle("codio:qq-status", () => refreshQQPlaybackSession(false));
+  ipcMain.handle("codio:qq-status", (_event, options) => options?.recover === false ? readQQStatus() : refreshQQPlaybackSession(false));
   ipcMain.handle("codio:local-import", importLocalFiles);
   ipcMain.handle("codio:local-library", () => localLibrary.list());
   ipcMain.handle("codio:qq-login", openQQLogin);

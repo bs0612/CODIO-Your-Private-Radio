@@ -247,10 +247,10 @@ export function createNeutralTransitionPlan(
   outgoingTrackId: string,
   incomingTrackId: string,
   id: string,
-  reason: "manual-next" | "manual-previous" | "manual-select",
+  reason: "automatic" | "manual-next" | "manual-previous" | "manual-select",
   paused = false,
 ): TransitionPlan {
-  const transitionDuration = paused ? .36 : reason === "manual-next" ? .9 : .62;
+  const transitionDuration = paused ? .36 : reason === "automatic" ? 3.2 : reason === "manual-next" ? .9 : .62;
   return {
     id,
     strategy: "breakdown-bridge",
@@ -265,6 +265,12 @@ export function createNeutralTransitionPlan(
     outgoingTempoRatio: 1,
     incomingTempoRatio: 1,
     ...makeCurves("breakdown-bridge"),
+    ...(reason === "automatic" ? {
+      // Unknown structure is not permission to suppress a real intro's bass.
+      outgoingLowCurve: curve(64, () => 1), incomingLowCurve: curve(64, () => 1),
+      outgoingMidCurve: curve(64, () => 1), incomingMidCurve: curve(64, () => 1),
+      outgoingHighCurve: curve(64, () => 1), incomingHighCurve: curve(64, () => 1),
+    } : {}),
     confidence: 0,
     reasons: ["分析不可用，使用 neutral bridge", paused ? "暂停状态不伪造节拍" : "保留歌曲原速"],
     fallback: "breakdown-bridge",
@@ -647,8 +653,8 @@ export function analyzePcmTrack({ trackId, sampleRate, channels, sourceSignature
   };
 }
 
-function makeCurves(strategy: TransitionStrategy, size = 64, switchPoint = .56) {
-  const angle = (x: number) => Math.asin(.18) + (Math.PI / 2 - Math.asin(.18)) * smooth(x);
+function makeCurves(strategy: TransitionStrategy, size = 64, switchPoint = .56, initialGain = .18) {
+  const angle = (x: number) => Math.asin(initialGain) + (Math.PI / 2 - Math.asin(initialGain)) * smooth(x);
   if (strategy === "downbeat-cut") {
     return {
       outgoingGainCurve: curve(size, (x) => Math.cos(angle(x))),
@@ -666,11 +672,11 @@ function makeCurves(strategy: TransitionStrategy, size = 64, switchPoint = .56) 
       outgoingGainCurve: curve(size, (x) => Math.cos(angle(x))),
       incomingGainCurve: curve(size, (x) => Math.sin(angle(x))),
       outgoingLowCurve: curve(size, (x) => 1 - .72 * smooth(clamp((x - .22) / .58))),
-      incomingLowCurve: curve(size, (x) => .22 + .78 * smooth(clamp((x - .48) / .46))),
+      incomingLowCurve: curve(size, (x) => .6 + .4 * smooth(clamp((x - .35) / .5))),
       outgoingMidCurve: curve(size, (x) => 1 - .28 * smooth(x)),
-      incomingMidCurve: curve(size, (x) => .68 + .32 * smooth(x)),
+      incomingMidCurve: curve(size, (x) => .84 + .16 * smooth(x)),
       outgoingHighCurve: curve(size, (x) => 1 - .2 * smooth(x)),
-      incomingHighCurve: curve(size, (x) => .78 + .22 * smooth(x)),
+      incomingHighCurve: curve(size, (x) => .88 + .12 * smooth(x)),
     };
   }
   return {
@@ -736,22 +742,41 @@ export function planSilenceHandoff(outgoing: TrackAnalysis, incoming: TrackAnaly
   };
 }
 
+function fadeAwareMixLead(analysis: TrackAnalysis) {
+  // Relative dynamics INSIDE this song, not cross-song loudness or a new
+  // silence boundary. Keep the entire fade/reverb playing to effectiveEnd.
+  const end = analysis.effectiveEnd, start = Math.max(analysis.effectiveStart, end - 32), width = .5;
+  if (end - start < 8) return 0;
+  const bins = Array.from({ length: Math.ceil((end - start) / width) }, () => ({ sum: 0, count: 0 }));
+  for (const frame of analysis.featureFrames || []) {
+    if (!Number.isFinite(frame.time) || !Number.isFinite(frame.energy) || frame.energy < 0 || frame.energy > 1 || frame.time < start || frame.time >= end) continue;
+    const bin = bins[Math.floor((frame.time - start) / width)];
+    if (bin) { bin.sum += frame.energy; bin.count++; }
+  }
+  if (bins.filter(bin => bin.count > 0).length < bins.length * .9) return 0;
+  const levels = bins.map(bin => bin.sum / Math.max(1, bin.count));
+  const referenceLevels = levels.slice(0, -8).sort((a, b) => a - b);
+  const reference = referenceLevels[Math.floor(referenceLevels.length * .7)] || 0;
+  if (reference <= 0) return 0;
+  let quietTail = 0;
+  for (let index = levels.length - 1; index >= 0 && levels[index] < reference * .25; index--) quietTail += width;
+  // No late sustained fade, no permission to widen a measured safe window.
+  // Leave eight seconds of still-substantial music in front of that fade.
+  return quietTail >= 1 ? Math.min(16, end - start, quietTail + 8) : 0;
+}
+
 export function planTransition(outgoing: TrackAnalysis, incoming: TrackAnalysis, id = `transition-${Date.now()}`): TransitionPlan {
   const incomingBpm = nearestTempo(incoming.bpm || outgoing.bpm || 96, outgoing.bpm || 96);
   const tempoRatio = outgoing.bpm > 0 && incomingBpm > 0 ? outgoing.bpm / incomingBpm : 1;
   const tempoDistance = Math.abs(tempoRatio - 1);
   const beatReliable = outgoing.tempoStable && incoming.tempoStable && outgoing.beatGridConfidence >= .58 && incoming.beatGridConfidence >= .58;
   const phraseReliable = beatReliable && outgoing.meter === 4 && incoming.meter === 4 && outgoing.phraseConfidence >= .5 && incoming.phraseConfidence >= .5;
-  if (!beatReliable) {
-    const boundaryPlan = planSilenceHandoff(outgoing, incoming, incoming.trackId, id);
-    if (boundaryPlan) return boundaryPlan;
-  }
   const vocalConflict = outgoing.outroFocus === "vocal" && incoming.introFocus === "vocal";
   const bassConflict = finalValue(outgoing.bassEnergyByBar, outgoing.outroFocus === "beats" ? .72 : .42) > .68 && (incoming.bassEnergyByBar[0] ?? (incoming.introFocus === "beats" ? .72 : .42)) > .68;
   const lowConfidence = Math.min(outgoing.analysisConfidence, incoming.analysisConfidence) < .46;
   const strategy: TransitionStrategy = phraseReliable && tempoDistance <= .04 && !vocalConflict
     ? "phrase-eq-blend"
-    : (vocalConflict || tempoDistance > .06) && Math.min(outgoing.beatGridConfidence, incoming.beatGridConfidence) >= .38
+    : vocalConflict && beatReliable && Math.min(outgoing.outroConfidence, incoming.introConfidence) >= .6
       ? "downbeat-cut"
       : "breakdown-bridge";
   // The outgoing deck stays at 1x. Matching a midpoint tempo would drift against it.
@@ -759,7 +784,9 @@ export function planTransition(outgoing: TrackAnalysis, incoming: TrackAnalysis,
   const incomingTempoRatio = targetBpm ? clamp(targetBpm / incomingBpm, .96, 1.04) : 1;
   const outgoingTempoRatio = 1;
   const beatSeconds = 60 / Math.max(1, targetBpm || outgoing.bpm || 96);
-  const available = Math.max(0, outgoing.effectiveEnd - Math.max(outgoing.effectiveStart, reliableCue(outgoing.safeOutCues, outgoing.effectiveEnd - 12)));
+  const cueAvailable = Math.max(0, outgoing.effectiveEnd - Math.max(outgoing.effectiveStart, reliableCue(outgoing.safeOutCues, outgoing.effectiveEnd - 12)));
+  const fadeLead = strategy === "breakdown-bridge" ? fadeAwareMixLead(outgoing) : 0;
+  const available = Math.max(cueAvailable, fadeLead);
   const requestedBars: Array<4 | 8 | 16 | 32> = strategy === "phrase-eq-blend" ? [16, 8, 4] : strategy === "breakdown-bridge" ? [8, 4] : [4];
   const transitionBars = requestedBars.find((bars) => bars * 4 * beatSeconds <= available + .35) || 4;
   const musicalDuration = transitionBars * 4 * beatSeconds;
@@ -794,18 +821,19 @@ export function planTransition(outgoing: TrackAnalysis, incoming: TrackAnalysis,
   }
   const confidence = clamp((outgoing.analysisConfidence + incoming.analysisConfidence + outgoing.beatGridConfidence + incoming.beatGridConfidence) / 4 - (vocalConflict ? .08 : 0) - (bassConflict ? .06 : 0) - tempoDistance);
   const reasons = [
-    strategy === "phrase-eq-blend" ? "可靠的四拍 beat grid 与乐句边界" : strategy === "downbeat-cut" ? "避免长时间双人声或不透明拉伸" : "结构置信度不足，按能量与音色安全桥接",
+    strategy === "phrase-eq-blend" ? "可靠的四拍 beat grid 与乐句边界" : strategy === "downbeat-cut" ? "潜在人声重叠，使用可靠拍点短交接" : "原速渐进融合，不因速度差异直接硬切",
     tempoDistance <= .04 ? `BPM 差异 ${(tempoDistance * 100).toFixed(1)}%，只轻调 incoming` : "保留原速，避免明显拉伸",
     vocalConflict ? "检测到双人声风险" : "未检测到明显双人声冲突",
     bassConflict ? "低频交换在 switch point 完成" : "低频重叠风险较低",
     lowConfidence ? "分析置信度较低，使用保守方案" : "分析置信度足以执行所选策略",
+    ...(fadeLead > cueAvailable ? ["根据本曲末端持续渐弱提前叠入，尾奏和混响仍播放至有效结束"] : []),
   ];
   return {
     id, strategy, outgoingTrackId: outgoing.trackId, incomingTrackId: incoming.trackId,
     outgoingCue, incomingCue, transitionBars, transitionDuration,
     switchPoint,
     targetBpm, outgoingTempoRatio, incomingTempoRatio,
-    ...makeCurves(strategy, 64, switchPoint), confidence, reasons,
+    ...makeCurves(strategy, 64, switchPoint, strategy === "breakdown-bridge" ? .26 : .18), confidence, reasons,
     fallback: beatReliable && !lowConfidence ? "downbeat-cut" : "breakdown-bridge",
   };
 }

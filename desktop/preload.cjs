@@ -17,7 +17,7 @@ contextBridge.exposeInMainWorld("codioDesktop", {
     library: () => ipcRenderer.invoke("codio:local-library"),
   },
   qqMusic: {
-    getStatus: () => ipcRenderer.invoke("codio:qq-status"),
+    getStatus: (options) => ipcRenderer.invoke("codio:qq-status", { recover: options?.recover !== false }),
     login: (options) => ipcRenderer.invoke("codio:qq-login", { forceAuthorization: options?.forceAuthorization === true }),
     logout: () => ipcRenderer.invoke("codio:qq-logout"),
     search: (query, page = 1) => ipcRenderer.invoke("codio:qq-search", query, page),

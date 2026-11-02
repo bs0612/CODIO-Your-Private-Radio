@@ -346,6 +346,15 @@ test("a prepared real initial waveform is drawn fully on the first frame, not ea
   assertHiddenUntouched(h);cleanup();
 });
 
+test("an empty analysis waveform cannot mask an already prepared real curve", () => {
+  const h=waveHarness(false),wave=Array.from({length:96},(_,i)=>(i%12)/12);
+  h.context.trackAnalysisRef.current.set("current-id",{waveform:[]});
+  h.context.initialWaveformRef.current={trackId:"current-id",waveform:wave};h.context.displayedWaveformRef.current=[];
+  const cleanup=h.waveEffect();h.step();
+  h.context.displayedWaveformRef.current.forEach((value,index)=>assert.ok(Math.abs(value-wave[index])<1e-12));
+  assert.ok(new Set(h.visible.calls.paths[0].map(point=>point[1])).size>5);cleanup();
+});
+
 test("missing visible canvas does not fall back to painting an invisible bar", () => {
   for (const open of [false, true]) {
     const h = waveHarness(open);

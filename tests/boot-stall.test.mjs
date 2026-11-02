@@ -9,6 +9,8 @@ import ts from "typescript";
 const radioSource = await readFile(new URL("../app/RadioExperience.tsx", import.meta.url), "utf8");
 const mainSource = await readFile(new URL("../desktop/main.cjs", import.meta.url), "utf8");
 const intelligenceSource = await readFile(new URL("../app/listening-intelligence.ts", import.meta.url), "utf8");
+const intelligence = await import(`data:text/javascript;base64,${Buffer.from(ts.transpileModule(intelligenceSource,
+  { compilerOptions: { target: ts.ScriptTarget.ES2022, module: ts.ModuleKind.ES2022 } }).outputText).toString("base64")}`);
 const declarations = new Map(), laneBeginCalls = [];
 let startupReleaseEffect,bootProgressInitializer,bootProgressElement,warmSourceProgressBranch,coldSourceProgressBranch,
   learningContextEffect,learningContextDependencies,scoringOptionsFactory;
@@ -179,8 +181,11 @@ test("the actual weak-context effect defers changed weather and time until entry
     assert.deepEqual(contextCalls,["initial","startup_ready"],`visible count ${visibleCount}: weak context cannot queue a second catalogue`);
     assert.equal(c.weatherSnapshotRef.current.text,"Rain · 11°C","real context continues updating while preparation is protected");
     let scoreHour=hour;
-    const scoreContext={activeQQTrackLiveRef:{current:null},libraryFeatures:[],profile:{meaningfulSignalCount:1},library:[],
-      Date:class{getHours(){return scoreHour;}},weatherSnapshotRef:{current:{...c.weatherSnapshotRef.current}},weatherContext:"Clear · 18°C"};
+    const scoreMemory=intelligence.createEmptyListeningMemory();
+    const scoreContext={activeQQTrackLiveRef:{current:null},libraryFeatures:[],memory:scoreMemory,
+      profile:{...intelligence.deriveListeningProfile(scoreMemory,1000),meaningfulSignalCount:1},library:[],
+      prepareScoringEvidence:intelligence.prepareScoringEvidence,scoringEvidence:undefined,
+      Date:class{static now(){return 1000;}getHours(){return scoreHour;}},weatherSnapshotRef:{current:{...c.weatherSnapshotRef.current}},weatherContext:"Clear · 18°C"};
     const factoryJS=ts.transpileModule(`const factory=${scoringOptionsFactory};`,{compilerOptions:{target:ts.ScriptTarget.ES2022,module:ts.ModuleKind.None}}).outputText;
     const scoreOptions=new Function("context",`with(context){${factoryJS};return factory;}`)(scoreContext);
     const options=scoreOptions();
@@ -281,6 +286,33 @@ test("ordinary startup connection keeps initial/library/source work behind the e
   h.run();assert.equal(update.startupReady,true);
   const queued=h.timers.filter(timer=>timer.delay===240&&!timer.cancelled);assert.equal(queued.length,1);
   queued[0].callback();assert.equal(h.runs.length,1);assert.ok(h.runs[0][2].includes("initial"));assert.ok(h.runs[0][2].includes("qq_library_synced"));
+});
+
+test("QQ library completion after the UI deadline still publishes evidence and queues a real fill without touching visible cards", async () => {
+  const h=reconnectHarness("ready");let complete;
+  h.context.window.codioDesktop.qqMusic.library=()=>new Promise(resolve=>{complete=resolve;});
+  const pending=h.connect(true);await microtasks();
+  const deadline=h.timers.find(timer=>timer.delay===10000&&!timer.cancelled);assert.ok(deadline);deadline.callback();
+  await pending;assert.equal(h.context.qqConnection,"connected");assert.equal(h.context.qqTasteSnapshotRef.current,null);
+  const snapshot={topArtists:[],playlistNames:[],playlists:[],tracks:[{mid:"late-known-track"}],likedCount:0};
+  complete(snapshot);await microtasks();
+  assert.equal(h.context.qqTasteSnapshotRef.current,snapshot);
+  assert.ok(h.context.recommendationUpdateRef.current.triggers.has("qq_library_synced"));
+  const queued=h.timers.filter(timer=>timer.delay===240&&!timer.cancelled);assert.equal(queued.length,1);
+  queued[0].callback();assert.equal(h.runs.length,1);assert.ok(h.runs[0][2].includes("qq_library_synced"));
+  assert.equal(h.context.recommendationVisibleRef.current.matched,h.matched);assert.equal(h.context.recommendationVisibleRef.current.frontier,h.frontier);
+});
+
+test("a late library result from an older account/sync cannot overwrite newer evidence", async () => {
+  for(const newer of ["sync","authorization"]){
+    const h=reconnectHarness("ready");let complete;
+    h.context.window.codioDesktop.qqMusic.library=()=>new Promise(resolve=>{complete=resolve;});
+    const pending=h.connect(true);await microtasks();h.timers.find(timer=>timer.delay===10000&&!timer.cancelled).callback();await pending;
+    const revision=h.context.recommendationUpdateRef.current.revision;
+    if(newer==="sync")h.context.qqSyncRevisionRef.current++;else h.context.qqAuthorizationRevisionRef.current++;
+    complete({topArtists:[],playlistNames:[],playlists:[],tracks:[{mid:"stale-track"}],likedCount:0});await microtasks();
+    assert.equal(h.context.qqTasteSnapshotRef.current,null);assert.equal(h.context.recommendationUpdateRef.current.revision,revision);
+  }
 });
 
 test("an older pending source authorization rejection cannot overwrite a newer successful QQ authorization",async()=>{

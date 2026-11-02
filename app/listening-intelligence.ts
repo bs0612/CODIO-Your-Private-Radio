@@ -892,11 +892,14 @@ function featureTags(candidate: CandidateTrack) {
 const BROAD_GENRE = /^(?:genre:)?(?:pop|pop\/rock|流行|r&b|rnb|r&b\/soul|rock|摇滚|electronic|electronica|电子|dance|舞曲|hip[ -]?hop|rap(?:\/hip[ -]?hop)?|说唱|jazz|爵士|folk|民谣|classical|古典|soundtrack|原声)$/i;
 const tasteTagWeight = (tag: string) => tag.startsWith("language:") ? .02 : BROAD_GENRE.test(tag) ? .15 : 1;
 
-function songStyleLink(known: TrackFeatureVector, target: TrackFeatureVector) {
+function songStyleLink(known: TrackFeatureVector, target: TrackFeatureVector, cache?: WeakMap<TrackFeatureVector, Map<string, number>>) {
   const reliable = (features: TrackFeatureVector) => {
+    const cached = cache?.get(features);
+    if (cached) return cached;
     const tags = new Map<string, number>();
     features.tags.filter(tag => tag.value && tag.source === "provider_metadata" && tag.profileEligible && tag.confidence >= .6)
       .forEach(tag => tags.set(normalize(tag.value!), Math.max(tag.confidence, tags.get(normalize(tag.value!)) || 0)));
+    cache?.set(features, tags);
     return tags;
   };
   const a = reliable(known), b = reliable(target);
@@ -932,9 +935,42 @@ function tempoAffinity(layer: ProfileLayer, bpm: FeatureEvidence<number>) {
     / total * Math.min(1, total) * bpm.confidence : 0;
 }
 
-export function scoreCandidate(candidate: CandidateTrack, profile: DerivedListeningProfile, memory: ListeningMemory, lane: RecommendationLane, now = Date.now(), options: { allowRepeat?: boolean; current?: TrackFeatureVector; timeBucket?: string; weather?: string; tasteCalibrated?: boolean; libraryFeatures?: TrackFeatureVector[] } = {}): RecommendationScore {
-  const tags = featureTags(candidate).filter((tag) => tag.profileEligible && tag.confidence >= .45);
+export function prepareScoringEvidence(profile: DerivedListeningProfile, memory: ListeningMemory, now: number, librarySource?: TrackFeatureVector[]) {
   const preferences = activePreferences(memory, now);
+  const trackPreferences = new Map(preferences.filter(event => event.targetType === "track").map(event => [event.targetKey, event]));
+  const libraryFeatures = (librarySource || []).filter(item => item.inLibrary || item.likedInProvider)
+    .filter(item => trackPreferences.get(canonicalTrackKey(item.provider, item.trackId))?.value !== "less").slice(0, 600);
+  const knownTracks = Object.values(memory.trackMemories);
+  const examples = new Map<string, { features: TrackFeatureVector; weight: number }>();
+  for (const feature of libraryFeatures) examples.set(canonicalTrackKey(feature.provider, feature.trackId), { features: feature, weight: feature.likedInProvider ? .8 : .5 });
+  for (const known of knownTracks) if (known.features && (known.effectivePlayCount || 0) > 0 && known.completionCount > 0) {
+    const features = { ...known.features, tags: known.features.tags.filter(tag =>
+      [profile.lifetimeProfile, profile.recentProfile, profile.sessionProfile].some(layer => (layer.tagAffinities[normalize(tag.value || "")] || 0) > 0)) };
+    if (!examples.has(known.trackKey)) examples.set(known.trackKey, { features, weight: .65 });
+  }
+  for (const [key, event] of trackPreferences) {
+    const features = event.features || memory.trackMemories[key]?.features;
+    if (event.value === "more" && features) examples.set(key, { features, weight: 1 });
+    else examples.delete(key);
+  }
+  const libraryGenreTracks = new Map<string, Set<string>>();
+  for (const feature of libraryFeatures) for (const tag of feature.tags) {
+    if (tag.source !== "provider_metadata" || !tag.profileEligible || tag.confidence < .6 || !tag.value || /^language:/i.test(tag.value)) continue;
+    const value = normalize(tag.value), tracks = libraryGenreTracks.get(value) || new Set<string>();
+    tracks.add(canonicalTrackKey(feature.provider, feature.trackId)); libraryGenreTracks.set(value, tracks);
+  }
+  const expiresAt = Math.min(memory.sessionIntent && memory.sessionIntent.expiresAt > now ? memory.sessionIntent.expiresAt : Infinity,
+    ...preferences.filter(event => event.scope === "session").map(event => event.createdAt + SESSION_INTENT_TTL_MS));
+  return { profile, memory, librarySource, preparedAt: now, expiresAt, preferences, trackPreferences, libraryFeatures, knownTracks, examples,
+    libraryGenreTracks, styleCache: new WeakMap<TrackFeatureVector, Map<string, number>>() };
+}
+
+export function scoreCandidate(candidate: CandidateTrack, profile: DerivedListeningProfile, memory: ListeningMemory, lane: RecommendationLane, now = Date.now(), options: { allowRepeat?: boolean; current?: TrackFeatureVector; timeBucket?: string; weather?: string; tasteCalibrated?: boolean; libraryFeatures?: TrackFeatureVector[]; evidence?: ReturnType<typeof prepareScoringEvidence> } = {}): RecommendationScore {
+  const tags = featureTags(candidate).filter((tag) => tag.profileEligible && tag.confidence >= .45);
+  const supplied = options.evidence;
+  const evidence = supplied && supplied.profile === profile && supplied.memory === memory && supplied.librarySource === options.libraryFeatures
+    && now >= supplied.preparedAt && now < supplied.expiresAt ? supplied : prepareScoringEvidence(profile, memory, now, options.libraryFeatures);
+  const { preferences, trackPreferences, libraryFeatures, knownTracks, examples, libraryGenreTracks, styleCache } = evidence;
   const instrumentalPreferences = preferences.filter(event => event.targetType === "feature" && normalize(event.targetKey) === "instrumental");
   // The controlled category has one explicit contribution. Its profile entry
   // remains visible/withdrawable, but is not counted again as a generic tag.
@@ -973,24 +1009,8 @@ export function scoreCandidate(candidate: CandidateTrack, profile: DerivedListen
     : aggregate ? (aggregate.positive - aggregate.negative) * eventAgeWeight(aggregate.firstSeenAt, now, LIFETIME_WINDOW_MS) : 0;
   const trackBehavior = aggregateTrack + memory.rawEvents.filter((event): event is PlaySettledEvent => event.type === "play_settled" && event.trackKey === candidate.canonicalKey)
     .reduce((sum, event) => sum + implicitSignalStrength(event) * eventAgeWeight(event.settledAt, now, LIFETIME_WINDOW_MS), 0);
-  const trackPreferences = new Map(preferences.filter(event => event.targetType === "track").map(event => [event.targetKey, event]));
-  const libraryFeatures = (options.libraryFeatures || []).filter(item => item.inLibrary || item.likedInProvider)
-    .filter(item => trackPreferences.get(canonicalTrackKey(item.provider, item.trackId))?.value !== "less").slice(0, 600);
-  const examples = new Map<string, { features: TrackFeatureVector; weight: number }>();
-  for (const feature of libraryFeatures) examples.set(canonicalTrackKey(feature.provider, feature.trackId), { features: feature, weight: feature.likedInProvider ? .8 : .5 });
-  for (const known of Object.values(memory.trackMemories)) if (known.features && (known.effectivePlayCount || 0) > 0 && known.completionCount > 0) {
-    // Corrected/decayed facts only. Replays still support one distinct work.
-    const features = { ...known.features, tags: known.features.tags.filter(tag =>
-      [profile.lifetimeProfile, profile.recentProfile, profile.sessionProfile].some(layer => (layer.tagAffinities[normalize(tag.value || "")] || 0) > 0)) };
-    if (!examples.has(known.trackKey)) examples.set(known.trackKey, { features, weight: .65 });
-  }
-  for (const [key, event] of trackPreferences) {
-    const features = event.features || memory.trackMemories[key]?.features;
-    if (event.value === "more" && features) examples.set(key, { features, weight: 1 });
-    else examples.delete(key);
-  }
   const links = [...examples].filter(([key]) => key !== candidate.canonicalKey).map(([key, example]) => {
-    const style = songStyleLink(example.features, candidate.featureVector);
+    const style = songStyleLink(example.features, candidate.featureVector, styleCache);
     const tempo = reliableTempo(example.features.bpm) && reliableTempo(candidate.featureVector.bpm)
       ? Math.max(0, (tempoSimilarity(example.features.bpm.value!, candidate.featureVector.bpm.value!) - .5) * 2)
         * Math.min(example.features.bpm.confidence, candidate.featureVector.bpm.confidence) * .12 : 0;
@@ -1001,7 +1021,7 @@ export function scoreCandidate(candidate: CandidateTrack, profile: DerivedListen
   const positiveSimilarity = (links[0]?.similarity || 0) * .25 + (links[1]?.similarity || 0) * .05;
   const negativeSimilarity = Math.max(0, ...[...trackPreferences.values()].filter(event => event.value === "less").map(event => {
     const features = event.features || memory.trackMemories[event.targetKey]?.features;
-    return features ? songStyleLink(features, candidate.featureVector).similarity * .08 : 0;
+    return features ? songStyleLink(features, candidate.featureVector, styleCache).similarity * .08 : 0;
   }));
   const preferenceSimilarity = positiveSimilarity - negativeSimilarity;
   const verifiedTempo = reliableTempo(options.current?.bpm) && reliableTempo(candidate.featureVector.bpm);
@@ -1027,12 +1047,6 @@ export function scoreCandidate(candidate: CandidateTrack, profile: DerivedListen
   const positiveTaste = preferences.some(event => event.value === "more")
     || [profile.lifetimeProfile, profile.recentProfile, profile.sessionProfile].some(layer =>
       Object.values(layer.artistAffinities).some(value => value > 0) || Object.values(layer.tagAffinities).some(value => value > 0));
-  const libraryGenreTracks = new Map<string, Set<string>>();
-  for (const feature of libraryFeatures) for (const tag of feature.tags) {
-    if (tag.source !== "provider_metadata" || !tag.profileEligible || tag.confidence < .6 || !tag.value || /^language:/i.test(tag.value)) continue;
-    const value = normalize(tag.value), tracks = libraryGenreTracks.get(value) || new Set<string>();
-    tracks.add(canonicalTrackKey(feature.provider, feature.trackId)); libraryGenreTracks.set(value, tracks);
-  }
   const calibrated = options.tasteCalibrated ?? (positiveTaste || candidate.inLibrary || candidate.featureVector.artistFamiliarity > 0 || libraryGenreTracks.size > 0);
   const observedArtist = Math.max(artistAffinity, recentArtist, sessionArtist);
   const artistLinked = artistPreference > 0 || observedArtist >= .25 || candidate.featureVector.artistFamiliarity >= .5;
@@ -1055,13 +1069,13 @@ export function scoreCandidate(candidate: CandidateTrack, profile: DerivedListen
   // it; a declaration, replay of one work, language or BPM cannot supply votes.
   const artistStyleTracks = new Set<string>();
   const supportsArtistStyle = (features?: TrackFeatureVector) => features && normalize(features.artist) === artist
-    && songStyleLink(features, candidate.featureVector).overlap >= .5
+    && songStyleLink(features, candidate.featureVector, styleCache).overlap >= .5
     && features.tags.some(tag => tag.source === "provider_metadata" && tag.profileEligible && tag.confidence >= .6
       && relatedGenres.some(related => related.value === normalize(tag.value || "")));
   const rejectedTracks = new Set(preferences.filter(event => event.targetType === "track" && event.value === "less").map(event => event.targetKey));
   for (const event of preferences) if (event.targetType === "track" && event.value === "more" && !rejectedTracks.has(event.targetKey)
     && supportsArtistStyle(event.features || memory.trackMemories[event.targetKey]?.features)) artistStyleTracks.add(event.targetKey);
-  for (const known of Object.values(memory.trackMemories)) if (!rejectedTracks.has(known.trackKey)
+  for (const known of knownTracks) if (!rejectedTracks.has(known.trackKey)
     && (known.effectivePlayCount || 0) > 0 && known.completionCount > 0 && supportsArtistStyle(known.features)) artistStyleTracks.add(known.trackKey);
   const collectedStyleTracks = new Set(libraryFeatures.filter(feature => supportsArtistStyle(feature)
     && !rejectedTracks.has(canonicalTrackKey(feature.provider, feature.trackId))).map(feature => canonicalTrackKey(feature.provider, feature.trackId)));
@@ -1224,6 +1238,7 @@ export function createRecommendationPool(lane: RecommendationLane) {
     status: "idle" as "idle" | "pending" | "completed" | "insufficient_candidates" | "failed",
     error: null as string | null,
     candidates: [] as CandidateTrack[], visible: [] as string[], hidden: [] as string[], exposure: [] as string[],
+    acquiredPreferenceIds: [] as string[],
   };
 }
 
@@ -1295,6 +1310,15 @@ export function recommendationAcquisitionSeeds(lane: RecommendationLane, memory:
     // from match. Exclude established artists to seek adjacent new directions.
     for (const [genre, evidence] of genreOrder.slice(0, 16))
       add(genre.replace(/^genre:/, ""), "adjacent_verified_style", "provider genre on positively evidenced works; a bounded exploration bridge, not measured sound similarity", evidence.trackIds, [], artists);
+    // A verified artist declaration is a real relationship, but not proof of
+    // this artist's whole sound. Acquire bounded trials for frontier explicitly;
+    // otherwise an artist-only preference has no viable acquisition route.
+    for (const event of preferences.filter(event => event.targetType === "artist")) {
+      const artist = event.artist || event.targetKey;
+      if ((supportedArtists.get(normalize(artist))?.size || 0) >= 2) continue;
+      add(artist, "explicit_artist_trial", "explicit artist preference; unheard work is an uncertain artist trial, not proven sound similarity",
+        [`artist:${normalize(artist)}`], [artist], artists.filter(other => normalize(other) !== normalize(artist)));
+    }
     const established = new Set(artists.map(normalize));
     for (const feature of features) {
       const credits = feature.artist.split(/\s*(?:\/|;|、|,|\s&\s|\sfeat\.?\s|\sft\.?\s)\s*/i).filter(Boolean);
@@ -1308,7 +1332,7 @@ export function recommendationAcquisitionSeeds(lane: RecommendationLane, memory:
   // Artist, verified style and favorite-anchor retrieval all get a turn. A
   // newly mentioned artist must not push every established source out of eight slots.
   const strategies = lane === "match" ? ["verified_artist_works", "specific_verified_style", "exact_favorite_anchor"]
-    : ["adjacent_verified_style", "verified_collaboration_credit"];
+    : ["adjacent_verified_style", "verified_collaboration_credit", "explicit_artist_trial"];
   const groups = strategies.map(strategy => seeds.filter(seed => seed.strategy === strategy));
   const ordered: typeof seeds = [];
   for (let index = 0; ordered.length < seeds.length; index++) groups.forEach(group => { if (group[index]) ordered.push(group[index]); });

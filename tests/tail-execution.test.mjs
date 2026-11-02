@@ -128,7 +128,7 @@ function wireHarness({ paused = false } = {}) {
     lyricLinesLiveRef:{current:{trackId:"out",lines:[]}},
     window:{setTimeout:()=>1,clearTimeout(){},codioDesktop:{qqMusic:{}}},
     transitionPairKey:(a,b)=>`${a}→${b}`,
-    notifySystem(){},setPlaybackTime(){},setProgress(){},setIsPlaying(){},armPlaybackBoundaryCheck(){},recoverCurrentTrack(){},
+    notifySystem(){},setPlaybackTime(){},setProgress(){},setIsPlaying(){},armPlaybackBoundaryCheck(){},recoverCurrentTrack(){},prepareUpcomingTrack(){},
     advanceFromFinishedAudio(){advances++;},beginSeamlessCrossfade(){handoffs++;c.seamlessTransitionRef.current=true;},
     setBoundedCache(cache,key,value){cache.set(key,value);}};
   c.analysisForAudio=bind("analysisForAudio",c);
@@ -147,6 +147,26 @@ test("actual timeupdate waits for the sound-boundary cue, even without a cached 
 test("actual timeupdate cannot turn an explicit user pause into an automatic handoff", () => {
   const h=wireHarness({paused:true});h.out.currentTime=h.analysis.effectiveEnd-.02;h.out.ontimeupdate();
   assert.equal(h.handoffs(),0);assert.equal(h.advances(),0);
+});
+
+test("missing pair analysis still starts an honest original-speed overlap before file end", () => {
+  const h=wireHarness();h.c.trackAnalysisRef.current.clear();
+  h.out.currentTime=h.out.duration-3.1;h.out.ontimeupdate();
+  assert.equal(h.handoffs(),1,"no pair analysis must not disable every automatic mix");
+  assert.equal(h.advances(),0);
+});
+
+test("one failed automatic attempt can recover, but retries are bounded and honor the latest next track", async () => {
+  const h=wireHarness();let now=1000,calls=0;
+  h.c.Date={now:()=>now};
+  h.c.beginSeamlessCrossfade=async()=>{calls++;return "unavailable";};
+  h.out.currentTime=dj.planSilenceHandoff(h.analysis,null,"next").outgoingCue+.03;
+  h.out.ontimeupdate();await Promise.resolve();assert.equal(calls,1);
+  h.out.ontimeupdate();assert.equal(calls,1,"no busy-loop retry");
+  now+=650;h.out.ontimeupdate();await Promise.resolve();assert.equal(calls,2);
+  now+=650;h.out.ontimeupdate();await Promise.resolve();assert.equal(calls,3);
+  now+=650;h.out.ontimeupdate();assert.equal(calls,3,"three attempts per next-track identity");
+  h.c.playQueueRef.current[1]={mid:"new-next"};h.out.ontimeupdate();await Promise.resolve();assert.equal(calls,4);
 });
 
 test("actual timeupdate never applies a verified old tail to a replacement media source", () => {
@@ -198,7 +218,7 @@ function pendingTransitionHarness() {
     analyserNodesRef:{current:new Map()},currentCoverDataLiveRef:{current:""},lyricLinesLiveRef:{current:{trackId:"out",lines:[]}},
     notifySystem(){},setTransitionDisplay(){},stopTransitionCoordinator(){},resumeMusicAudioGraph:async()=>true,
     prepareTrack:async()=>gate,analysisForAudio:()=>analysis,releaseMusicAudio(audio){released.push(audio);},
-    advanceFromFinishedAudio(){throw Error("Cancellation must not advance playback");}};
+    window:{},withTimeout:promise=>promise,advanceFromFinishedAudio(){throw Error("Cancellation must not advance playback");}};
   c.abortActiveTransition=bind("abortActiveTransition",c);
   return {c,outgoing,incoming,next,release:()=>release({playback:{url:"source-next"},audio:incoming,coverData:""}),
     start:()=>bind("transitionToTrack",c)(next,1,"automatic","out"),released:()=>released};
@@ -234,7 +254,7 @@ function playingTransitionHarness() {
     readyState:2,paused,ended:false,volume:1,playbackRate:1,dataset:{},
     pause(){this.paused=true;calls.push(["pause",id]);},
     play(){this.paused=false;calls.push(["play",id]);this.onplay?.();return id==="next"?playGate:Promise.resolve();},
-    removeAttribute(name){if(name==="src")this.src="";},load(){},
+    removeAttribute(name){if(name==="src")this.src="";},load(){},removeEventListener(){},
     dispatchEvent(event){this[`on${event.type}`]?.(event);},addEventListener(){}});
   const outgoing=makeAudio("out",false),incoming=makeAudio("next",true);
   const parameter=()=>({value:1,cancelAndHoldAtTime(){},cancelScheduledValues(){},setValueAtTime(value){this.value=value;},
@@ -407,4 +427,121 @@ test("a complete phrase handoff initializes audible gain before play and never r
   assert.equal(h.c.musicAudioRef.current,h.incoming);assert.equal(h.c.activeQueueIndexRef.current,1);
   assert.ok(Math.abs(h.incoming.playbackRate*123-120)<1e-8);
   assert.equal(h.c.activeTransitionRef.current,null);
+});
+
+function completeHandoff(analyses) {
+  const h=playingTransitionHarness(),scheduled=[],seeks=[];
+  let position=0;
+  Object.defineProperty(h.incoming,"currentTime",{get:()=>position,set:value=>{seeks.push(value);position=value;}});
+  h.c.analysisForAudio=(id,audio)=>audio.readyState<1?null:analyses.get(id)||null;
+  h.c.startTransitionCoordinator=()=>{};
+  h.c.waitForTransitionAudioEnd=async(clock,end,_id,_commitAt,commit)=>{
+    const delta=end-clock.currentTime;clock.currentTime=end;
+    if(!h.outgoing.paused)h.outgoing.currentTime+=delta;
+    if(!h.incoming.paused)position+=delta*h.incoming.playbackRate;
+    commit?.();
+  };
+  for(const chain of h.c.analyserNodesRef.current.values())for(const [name,node] of Object.entries(chain))
+    if(node.gain)node.gain.setValueCurveAtTime=(values,start,duration)=>scheduled.push({name,values:[...values],start,duration});
+  h.c.scheduleDeckPlan=bind("scheduleDeckPlan",h.c,["holdAudioParam","scheduleCurve"]);
+  h.c.lockTransitionBeats=()=>{};
+  for(const name of ["setActiveQueueIndex","setActiveQQTrack","setCurrentCoverData","setPlaybackQuality","setLyricLines",
+    "rememberPlayedTrack","beginListeningForTrack","settleCurrentListening","holdTransitionDuringSettling","prepareUpcomingTrack"])h.c[name]=()=>{};
+  h.c.lyricAtTime=()=>"";h.c.recommendationSourceForTrack=()=>"search";
+  return {...h,scheduled,seeks};
+}
+
+for(const tail of [5,15,30])test(`complete production handoff releases a ${tail}s silent file tail at the verified sound end`, async()=>{
+  const a=pcm(tail),h=completeHandoff(new Map([["out",a]]));
+  h.outgoing.duration=a.duration;h.outgoing.currentTime=dj.planSilenceHandoff(a,null,"next").outgoingCue+.02;
+  const pending=h.start();await new Promise(resolve=>setImmediate(resolve));
+  assert.equal(h.incoming.paused,false);assert.ok(h.incomingChain.gain.gain.value>=.15);
+  h.finishPlay();assert.equal(await pending,"played");
+  assert.equal(h.c.musicAudioRef.current,h.incoming);assert.equal(h.c.activeQueueIndexRef.current,1);
+  assert.deepEqual(h.seeks,[0],"no skipped or restarted intro");
+  const start=h.c.window.codioPlaybackDiagnostics.find(item=>item.stage==="incoming_started");
+  assert.equal(start.analysisMode,"tail_only");assert.ok(start.outgoingTime<a.silence.lastAudibleTime);
+  const committed=h.c.window.codioPlaybackDiagnostics.find(item=>item.stage==="committed");
+  assert.ok(committed.outgoingTime<a.effectiveEnd+.1);assert.ok(a.duration-committed.outgoingTime>tail-a.silence.guardSeconds-.1);
+  assert.equal(h.scheduled.length,8,"actual gain and EQ automation for both decks");
+});
+
+test("no analysis uses an actual scheduled neutral mix, without claiming beat lock or seeking the intro",async()=>{
+  const h=completeHandoff(new Map());h.outgoing.currentTime=h.outgoing.duration-3.1;
+  const pending=h.start();await new Promise(resolve=>setImmediate(resolve));h.finishPlay();
+  assert.equal(await pending,"played");assert.equal(h.scheduled.length,8);assert.deepEqual(h.seeks,[0]);
+  assert.equal(h.c.activeQueueIndexRef.current,1);assert.equal(h.incoming.playbackRate,1);
+  assert.equal(h.c.window.codioPlaybackDiagnostics.find(item=>item.stage==="incoming_started").analysisMode,"neutral");
+  assert.ok(h.c.window.codioPlaybackDiagnostics.find(item=>item.stage==="scheduled").duration>2.8);
+});
+
+test("metadata-ready source adopts the existing incoming analysis before deciding the automatic strategy",async()=>{
+  const a=pcm(),b={...pcm(0),trackId:"next",duration:8,effectiveEnd:8};
+  const h=completeHandoff(new Map([["out",a],["next",b]])),listeners=new Map();
+  h.incoming.readyState=0;h.incoming.duration=NaN;
+  h.incoming.addEventListener=(name,callback)=>listeners.set(name,callback);
+  h.incoming.removeEventListener=(name,callback)=>{if(listeners.get(name)===callback)listeners.delete(name);};
+  const pending=h.start();await new Promise(resolve=>setImmediate(resolve));
+  assert.equal(h.incoming.paused,true);assert.ok(listeners.has("loadedmetadata"));
+  h.incoming.readyState=2;h.incoming.duration=8;listeners.get("loadedmetadata")();
+  await new Promise(resolve=>setImmediate(resolve));assert.equal(listeners.size,0);h.finishPlay();
+  assert.equal(await pending,"played");
+  assert.equal(h.c.window.codioPlaybackDiagnostics.find(item=>item.stage==="incoming_started").analysisMode,"pair");
+});
+
+test("late play resolution keeps the already-audible intro instead of discarding and restarting it",async()=>{
+  const a=pcm(),h=completeHandoff(new Map([["out",a]]));
+  const pending=h.start();await new Promise(resolve=>setImmediate(resolve));
+  h.outgoing.currentTime=a.effectiveEnd+.4;h.finishPlay();
+  assert.equal(await pending,"played");assert.equal(h.c.musicAudioRef.current,h.incoming);
+  assert.deepEqual(h.seeks,[0]);assert.equal(h.calls.filter(([name,id])=>name==="play"&&id==="next").length,1);
+  assert.ok(h.c.window.codioPlaybackDiagnostics.find(item=>item.stage==="scheduled").duration<=.15);
+});
+
+test("verified tail arriving during metadata preparation replaces the neutral file-end plan",async()=>{
+  const analyses=new Map(),a=pcm(),h=completeHandoff(analyses),listeners=new Map();
+  h.incoming.readyState=0;h.incoming.duration=NaN;
+  h.incoming.addEventListener=(name,callback)=>listeners.set(name,callback);
+  h.incoming.removeEventListener=(name,callback)=>{if(listeners.get(name)===callback)listeners.delete(name);};
+  const pending=h.start();await new Promise(resolve=>setImmediate(resolve));
+  analyses.set("out",a);h.incoming.readyState=2;h.incoming.duration=8;listeners.get("loadedmetadata")();
+  await new Promise(resolve=>setImmediate(resolve));h.finishPlay();assert.equal(await pending,"played");
+  const start=h.c.window.codioPlaybackDiagnostics.find(item=>item.stage==="incoming_started");
+  assert.equal(start.analysisMode,"tail_only");assert.equal(start.effectiveEnd,a.effectiveEnd);
+});
+
+test("automatic source/start waits are bounded by the real sound end, not the silent file duration",async()=>{
+  const a=pcm(30),h=completeHandoff(new Map([["out",a]])),budgets=[];
+  h.outgoing.duration=a.duration;
+  h.c.withTimeout=(promise,ms,label)=>{budgets.push({ms,label});return Promise.resolve(promise);};
+  const pending=h.start();await new Promise(resolve=>setImmediate(resolve));h.finishPlay();
+  assert.equal(await pending,"played");
+  for(const label of ["TRANSITION_SOURCE","TRANSITION_AUDIO_START"]){
+    const budget=budgets.find(item=>item.label===label);assert.ok(budget);assert.ok(budget.ms>0&&budget.ms<=1300,label);
+  }
+});
+
+test("the actual two-deck runtime schedules substantial shared music before a measured fade, not only two play calls",async()=>{
+  const rate=8000;
+  const make=(id,fade)=>{
+    const samples=Float32Array.from({length:30*rate},(_,i)=>Math.sin(i/rate*Math.PI*440)*
+      (fade&&i/rate>22?.15*Math.exp(-(i/rate-22)*1.2)+.00004:.15));
+    return {...dj.analyzePcmTrack({trackId:id,sampleRate:rate,channels:[samples],sourceSignature:`synth-${id}`}),
+      bpm:id==="out"?72:91,tempoStable:false,beatGridConfidence:.25,phraseConfidence:.1,meter:null,introFocus:"beats",outroFocus:"beats"};
+  };
+  const a=make("out",true),b=make("next",false),plan=dj.planTransition(a,b),h=completeHandoff(new Map([["out",a],["next",b]]));
+  h.outgoing.duration=a.duration;h.incoming.duration=b.duration;h.outgoing.currentTime=plan.outgoingCue+.02;
+  const pending=h.start();await new Promise(resolve=>setImmediate(resolve));h.finishPlay();assert.equal(await pending,"played");
+  const timing=h.c.window.codioPlaybackDiagnostics.find(item=>item.stage==="scheduled");
+  assert.equal(timing.strategy,"breakdown-bridge");assert.ok(timing.duration>9);assert.ok(timing.plannedDuration>9);
+  const gains=h.scheduled.filter(item=>item.name==="gain");assert.equal(gains.length,2);
+  const at=(curve,p)=>curve[Math.min(curve.length-1,Math.floor(p*(curve.length-1)))];
+  const energy=(analysis,t)=>analysis.featureFrames.reduce((last,frame)=>frame.time<=t?frame:last,{energy:0}).energy;
+  let shared=0;
+  for(let t=0;t<timing.duration;t+=.05){
+    if(energy(a,plan.outgoingCue+t)*at(gains[0].values,t/timing.duration)>.1
+      &&energy(b,plan.incomingCue+t)*at(gains[1].values,t/timing.duration)>.1)shared+=.05;
+  }
+  assert.ok(shared>4,`Only ${shared}s of normalized-envelope co-presence; an empty-tail fade is not a musical blend`);
+  assert.equal(h.c.musicAudioRef.current,h.incoming);assert.equal(h.incoming.playbackRate,1);assert.deepEqual(h.seeks,[0]);
 });

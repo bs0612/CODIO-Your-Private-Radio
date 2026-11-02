@@ -100,6 +100,39 @@ test("uncertain tempo falls back to an ambient bridge without time stretching", 
   assert.equal(plan.incomingTempoRatio, 1);
 });
 
+test("tempo mismatch by itself cannot turn a musical blend into a hard cut",()=>{
+  for(const bpm of [72,91,150]){
+    const plan=dj.planTransition(analysis("out",{bpm:120}),analysis("in",{bpm}));
+    assert.equal(plan.strategy,"breakdown-bridge");assert.equal(plan.incomingTempoRatio,1);
+    assert.ok(plan.transitionDuration>=5.5);assert.equal(plan.incomingCue,0);
+    assert.ok(plan.incomingGainCurve[0]>=.25);assert.ok(plan.incomingLowCurve[0]>=.6);
+    for(let i=0;i<plan.incomingGainCurve.length;i++)assert.ok(Math.abs(plan.incomingGainCurve[i]**2+plan.outgoingGainCurve[i]**2-1)<1e-8);
+  }
+});
+
+const fadeFrames=(energy,end=240)=>Array.from({length:320},(_,i)=>({time:end-32+i*.1,energy:energy(end-32+i*.1),bass:0,brightness:0,spectralFlux:0,vocalProbability:0}));
+test("a measured late fade moves the blend before music disappears but never crops the fade",()=>{
+  const out=analysis("unrelated-out",{bpm:72,tempoStable:false,beatGridConfidence:.3,phraseConfidence:.1,
+    safeOutCues:[{time:237.4,score:.34,reason:"weak late cue"}],
+    featureFrames:fadeFrames(t=>t<234?.7:Math.max(.00008,.7*Math.exp(-(t-234)*1.5)))});
+  const incoming=analysis("unrelated-in",{bpm:91});
+  const plan=dj.planTransition(out,incoming);
+  assert.equal(plan.strategy,"breakdown-bridge");assert.ok(plan.transitionDuration>=10);
+  assert.ok(plan.outgoingCue<232,"both songs must overlap before the old music has faded away");
+  assert.ok(Math.abs(plan.outgoingCue+plan.transitionDuration-240)<1e-8);
+  assert.equal(out.effectiveEnd,240,"a fade-aware overlap is not a silence crop");assert.equal(plan.incomingCue,0);
+  assert.ok(plan.reasons.some(reason=>reason.includes("持续渐弱")));
+});
+
+test("missing or sparse features, constant quiet music, and a mid-song pause cannot invent a fade window",()=>{
+  const safe={safeOutCues:[{time:238,score:.9,reason:"only confirmed window"}],tempoStable:false,beatGridConfidence:.2};
+  for(const featureFrames of [[],[{time:239,energy:.001}],fadeFrames(()=>.00008),fadeFrames(t=>t>230&&t<236?0:.7)]){
+    const plan=dj.planTransition(analysis("out",{...safe,featureFrames}),analysis("in",{bpm:91}));
+    assert.ok(plan.outgoingCue>=238);assert.ok(plan.transitionDuration<=2);
+    assert.ok(!plan.reasons.some(reason=>reason.includes("持续渐弱")));
+  }
+});
+
 test("automatic plans never stretch a short safe outro into earlier musical material", () => {
   const shortOutro = { safeOutCues: [{ time: 238, score: .9, reason: "last safe musical window" }] };
   for (const overrides of [
